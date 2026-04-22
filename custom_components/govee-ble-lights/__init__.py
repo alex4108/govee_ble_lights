@@ -55,9 +55,16 @@ async def internal_cache_setup(
         store = Store(hass, 1, f"{DOMAIN}/{entry.data.get(CONF_API_KEY)}.json")
         devices = await store.async_load()
         if devices:
-            _LOGGER.debug(f"{len(devices)} devices loaded from cache!")
+            _LOGGER.debug(f"{len(devices)} devices loaded from Cache")
+
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = Hub(api, devices=devices)
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    await asyncio.gather(
+        *[
+            hass.config_entries.async_forward_entry_setup(entry, domain)
+            for domain in PLATFORMS
+        ]
+    )
 
 
 def internal_unique_devices(uid: str, devices: list) -> list:
@@ -76,13 +83,14 @@ async def async_setup_ble(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     address = entry.unique_id
     assert address is not None
     ble_device = bluetooth.async_ble_device_from_address(hass, address.upper(), True)
+    # PATCH: do not raise if device not yet seen — loader patched to re-fetch at turn_on time
     if not ble_device:
-        raise ConfigEntryNotReady(
-            f"Could not find Govee BLE device with address {address}"
+        import logging
+        logging.getLogger(__name__).warning(
+            "Govee BLE device %s not yet discovered; entry will load anyway, connection will be attempted at turn_on", address
         )
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = Hub(None, address=address)
-
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
@@ -109,8 +117,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
-    if (MAJOR_VERSION, MINOR_VERSION) < (2025, 7):
-        raise Exception("unsupported hass version, need at least 2025.7")
+    if (MAJOR_VERSION, MINOR_VERSION) < (2023, 1):
+        raise Exception("unsupported hass version")
 
     # init storage for registries
     hass.data[DOMAIN] = {}
