@@ -53,6 +53,14 @@ _CONFIRM_TIMEOUT_S = 10.0
 # exhaustion or mid-write disconnect doesn't silently drop the command.
 _FIRE_AND_FORGET_ATTEMPTS = 3
 
+# Hard outer bound on connect / disconnect. bleak_retry_connector has its
+# own internal retries without a total budget; observed under concurrent
+# stress a single _connectBluetooth() took 129s and a client.disconnect()
+# took 9s. Wrapping these in asyncio.wait_for prevents one wedged proxy
+# from cascading into service-call timeouts several minutes long.
+_CONNECT_TIMEOUT_S = 15.0
+_DISCONNECT_TIMEOUT_S = 3.0
+
 
 def _decode_advert_state(service_info) -> bool | None:
     """Return True/False if any manufacturer_data entry matches the Govee
@@ -326,11 +334,24 @@ class GoveeBluetoothLight(LightEntity):
         for attempt in range(1, _FIRE_AND_FORGET_ATTEMPTS + 1):
             client = None
             try:
-                client = await self._connectBluetooth()
+                client = await asyncio.wait_for(
+                    self._connectBluetooth(), timeout=_CONNECT_TIMEOUT_S,
+                )
                 await client.write_gatt_char(
                     UUID_CONTROL_CHARACTERISTIC, command, False
                 )
                 return
+            except asyncio.TimeoutError:
+                last_exc = asyncio.TimeoutError(
+                    f"connect exceeded {_CONNECT_TIMEOUT_S}s"
+                )
+                _LOGGER.warning(
+                    "govee-ble-lights: %s %s connect attempt %d/%d timed out after %.1fs",
+                    self._canonical_mac(), label, attempt,
+                    _FIRE_AND_FORGET_ATTEMPTS, _CONNECT_TIMEOUT_S,
+                )
+                if attempt < _FIRE_AND_FORGET_ATTEMPTS:
+                    await asyncio.sleep(1.0)
             except Exception as exc:
                 last_exc = exc
                 _LOGGER.warning(
@@ -343,8 +364,10 @@ class GoveeBluetoothLight(LightEntity):
             finally:
                 if client is not None:
                     try:
-                        await client.disconnect()
-                    except Exception:
+                        await asyncio.wait_for(
+                            client.disconnect(), timeout=_DISCONNECT_TIMEOUT_S,
+                        )
+                    except (asyncio.TimeoutError, Exception):
                         pass
         raise ConnectionError(
             f"Govee {self._canonical_mac()} {label} write failed after "
@@ -387,10 +410,27 @@ class GoveeBluetoothLight(LightEntity):
                     return
                 client = None
                 try:
-                    client = await self._connectBluetooth()
+                    client = await asyncio.wait_for(
+                        self._connectBluetooth(), timeout=_CONNECT_TIMEOUT_S,
+                    )
                     await client.write_gatt_char(
                         UUID_CONTROL_CHARACTERISTIC, cmd, False
                     )
+                except asyncio.TimeoutError:
+                    last_exc = asyncio.TimeoutError(
+                        f"connect exceeded {_CONNECT_TIMEOUT_S}s"
+                    )
+                    _LOGGER.warning(
+                        "govee-ble-lights: %s power=%s connect attempt %d/%d timed out after %.1fs",
+                        self._canonical_mac(),
+                        want_on,
+                        attempt,
+                        _POWER_WRITE_ATTEMPTS,
+                        _CONNECT_TIMEOUT_S,
+                    )
+                    if attempt < _POWER_WRITE_ATTEMPTS:
+                        await asyncio.sleep(1.0)
+                    continue
                 except Exception as exc:
                     last_exc = exc
                     _LOGGER.warning(
@@ -411,8 +451,10 @@ class GoveeBluetoothLight(LightEntity):
                     # starves the advert-based confirmation loop.
                     if client is not None:
                         try:
-                            await client.disconnect()
-                        except Exception:
+                            await asyncio.wait_for(
+                                client.disconnect(), timeout=_DISCONNECT_TIMEOUT_S,
+                            )
+                        except (asyncio.TimeoutError, Exception):
                             pass
                 try:
                     await asyncio.wait_for(
