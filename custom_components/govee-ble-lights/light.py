@@ -12,7 +12,7 @@ from homeassistant.components import bluetooth
 from homeassistant.components.light import (ATTR_BRIGHTNESS, ATTR_RGB_COLOR, ATTR_EFFECT, ColorMode, LightEntity,
                                             LightEntityFeature, ATTR_COLOR_TEMP_KELVIN)
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.storage import Store
 
@@ -29,6 +29,24 @@ UUID_CONTROL_CHARACTERISTIC = '00010203-0405-0607-0809-0a0b0c0d2b11'
 EFFECT_PARSE = re.compile("\[(\d+)/(\d+)/(\d+)/(\d+)]")
 SEGMENTED_MODELS = ['H6053', 'H6072', 'H6102', 'H6199', 'H617A', 'H617C']
 PERCENT_MODELS = ['H617A']
+
+# Models whose BLE advertisement manufacturer_data encodes live on/off state.
+# The integration writes to the bulb over GATT without response, so a dropped
+# write is silent — HA's optimistic state can diverge from reality. Reading
+# the bulb's own broadcast reconciles it within one advertisement interval.
+ADVERT_STATE_MODELS = {"H617A", "H617C"}
+# H617A/C broadcast `ec 00 0a 01 <state>` under mfr id 0x0288 or 0x0388,
+# where <state> is 0x01 on / 0x00 off. Match on the prefix, not the mfr id.
+_ADVERT_GOVEE_EC_PREFIX = b"\xec\x00\x0a\x01"
+
+
+def _decode_advert_state(service_info) -> bool | None:
+    """Return True/False if any manufacturer_data entry matches the Govee
+    on/off pattern; None if no entry is recognizable."""
+    for mfr_bytes in (service_info.manufacturer_data or {}).values():
+        if len(mfr_bytes) == 5 and mfr_bytes[:4] == _ADVERT_GOVEE_EC_PREFIX:
+            return bool(mfr_bytes[4])
+    return None
 
 class LedCommand(IntEnum):
     """ A control command packet's type. """
@@ -189,10 +207,62 @@ class GoveeBluetoothLight(LightEntity):
         self._model = config_entry.data["model"]
         self._is_segmented = self._model in SEGMENTED_MODELS
         self._use_percent = self._model in PERCENT_MODELS
+        self._advert_state_supported = self._model in ADVERT_STATE_MODELS
+        self._unsub_advert = None
         self._ble_device = ble_device
         self._state = None
         self._brightness = None
         self._rgb_color = None
+
+    def _canonical_mac(self) -> str:
+        raw = (self._mac or "").replace(":", "").upper()
+        return ":".join(raw[i:i + 2] for i in range(0, 12, 2))
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if not self._advert_state_supported:
+            return
+
+        address = self._canonical_mac()
+        # Seed from HA's cached last service info so state is correct
+        # immediately after restart, not after the next advertisement.
+        last = bluetooth.async_last_service_info(self.hass, address, connectable=False)
+        if last is not None and self._apply_advert_state(last):
+            self.async_write_ha_state()
+
+        self._unsub_advert = bluetooth.async_register_callback(
+            self.hass,
+            self._async_handle_advertisement,
+            bluetooth.BluetoothCallbackMatcher(address=address),
+            bluetooth.BluetoothScanningMode.PASSIVE,
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub_advert is not None:
+            self._unsub_advert()
+            self._unsub_advert = None
+        await super().async_will_remove_from_hass()
+
+    @callback
+    def _async_handle_advertisement(self, service_info, change) -> None:
+        if self._apply_advert_state(service_info):
+            self.async_write_ha_state()
+
+    def _apply_advert_state(self, service_info) -> bool:
+        """Update self._state from a BLE advert. Returns True on change."""
+        new_state = _decode_advert_state(service_info)
+        if new_state is None or new_state == self._state:
+            return False
+        _LOGGER.debug(
+            "govee-ble-lights: %s advert state %s -> %s via %s rssi=%s",
+            self._canonical_mac(),
+            self._state,
+            new_state,
+            getattr(service_info, "source", "?"),
+            getattr(service_info, "rssi", "?"),
+        )
+        self._state = new_state
+        return True
 
     @property
     def effect_list(self) -> list[str] | None:
