@@ -232,6 +232,15 @@ class GoveeBluetoothLight(LightEntity):
         # arrives whose decoded state matches _expected_state.
         self._expected_state: bool | None = None
         self._state_confirmed: asyncio.Event | None = None
+        # Per-entity lock serializing turn_on / turn_off. HA's service
+        # dispatcher does NOT guarantee serialization at the entity level —
+        # three parallel light.turn_on on the same entity (e.g. an
+        # adaptive_lighting intercept firing alongside a bare call) run
+        # concurrently and race on _expected_state / _state_confirmed AND
+        # spawn concurrent GATT sessions on the same proxy. The lock
+        # collapses duplicates: first acquirer runs the write loop, later
+        # acquirers see _state already at target and early-out.
+        self._entity_lock: asyncio.Lock = asyncio.Lock()
 
     def _canonical_mac(self) -> str:
         raw = (self._mac or "").replace(":", "").upper()
@@ -473,6 +482,10 @@ class GoveeBluetoothLight(LightEntity):
         return self._state
 
     async def async_turn_on(self, **kwargs) -> None:
+        async with self._entity_lock:
+            await self._async_turn_on_inner(**kwargs)
+
+    async def _async_turn_on_inner(self, **kwargs) -> None:
         # Intentionally NOT setting self._state optimistically here: the
         # verify-and-retry loop below uses self._state as the last known
         # bulb state (maintained by _apply_advert_state). An optimistic
@@ -537,7 +550,8 @@ class GoveeBluetoothLight(LightEntity):
             await self._write_once(command, f"non-POWER cmd {i + 1}/{len(other_commands)}")
 
     async def async_turn_off(self, **kwargs) -> None:
-        await self._write_power_and_confirm(False)
+        async with self._entity_lock:
+            await self._write_power_and_confirm(False)
 
     async def _connectBluetooth(self) -> BleakClient:
         # PATCH: refresh BleakDevice from bluetooth registry each call (handles stale cache after proxy reboots)
