@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import array
+import asyncio
 import logging
 import re
 
@@ -38,6 +39,13 @@ ADVERT_STATE_MODELS = {"H617A", "H617C"}
 # H617A/C broadcast `ec 00 0a 01 <state>` under mfr id 0x0288 or 0x0388,
 # where <state> is 0x01 on / 0x00 off. Match on the prefix, not the mfr id.
 _ADVERT_GOVEE_EC_PREFIX = b"\xec\x00\x0a\x01"
+
+# Verify-and-retry budget for POWER writes on advert-capable models. Each
+# attempt writes a POWER packet and then waits up to _CONFIRM_TIMEOUT_S
+# for an advertisement whose decoded state matches. A typical H617A
+# broadcasts every 3-5s, so 10s per attempt gives two advertising windows.
+_POWER_WRITE_ATTEMPTS = 3
+_CONFIRM_TIMEOUT_S = 10.0
 
 
 def _decode_advert_state(service_info) -> bool | None:
@@ -213,6 +221,11 @@ class GoveeBluetoothLight(LightEntity):
         self._state = None
         self._brightness = None
         self._rgb_color = None
+        # Verify-and-retry coordination. _expected_state is the power state we
+        # are currently commanding; _state_confirmed fires when an advert
+        # arrives whose decoded state matches _expected_state.
+        self._expected_state: bool | None = None
+        self._state_confirmed: asyncio.Event | None = None
 
     def _canonical_mac(self) -> str:
         raw = (self._mac or "").replace(":", "").upper()
@@ -249,9 +262,29 @@ class GoveeBluetoothLight(LightEntity):
             self.async_write_ha_state()
 
     def _apply_advert_state(self, service_info) -> bool:
-        """Update self._state from a BLE advert. Returns True on change."""
+        """Update self._state from a BLE advert. Returns True on change.
+
+        While a POWER write is pending confirmation, an advert carrying the
+        pre-command (stale) state is ignored so the UI doesn't flap. A
+        matching advert signals _state_confirmed so the write loop can
+        return immediately.
+        """
         new_state = _decode_advert_state(service_info)
-        if new_state is None or new_state == self._state:
+        if new_state is None:
+            return False
+        if (
+            self._expected_state is not None
+            and new_state != self._expected_state
+        ):
+            # Stale pre-command advert; don't revert HA state mid-write.
+            return False
+        if (
+            self._expected_state is not None
+            and self._state_confirmed is not None
+            and new_state == self._expected_state
+        ):
+            self._state_confirmed.set()
+        if new_state == self._state:
             return False
         _LOGGER.debug(
             "govee-ble-lights: %s advert state %s -> %s via %s rssi=%s",
@@ -263,6 +296,84 @@ class GoveeBluetoothLight(LightEntity):
         )
         self._state = new_state
         return True
+
+    async def _write_power_and_confirm(self, want_on: bool) -> None:
+        """Write POWER and block until an advert confirms state==want_on.
+
+        Retries the write up to _POWER_WRITE_ATTEMPTS times. Raises
+        ConnectionError if still unconfirmed, or bubbles the last bleak
+        exception if every attempt also failed to connect/write.
+
+        Falls back to single fire-and-forget write for models that don't
+        broadcast state in their manufacturer_data, since we have no way
+        to confirm there.
+        """
+        payload = [0x1 if want_on else 0x0]
+        if not self._advert_state_supported:
+            client = await self._connectBluetooth()
+            await client.write_gatt_char(
+                UUID_CONTROL_CHARACTERISTIC,
+                self._prepareSinglePacketData(LedCommand.POWER, payload),
+                False,
+            )
+            return
+
+        self._expected_state = want_on
+        self._state_confirmed = asyncio.Event()
+        try:
+            # If the most recent advert already shows the desired state,
+            # no write is needed — the bulb is already there.
+            if self._state == want_on:
+                return
+
+            last_exc: Exception | None = None
+            cmd = self._prepareSinglePacketData(LedCommand.POWER, payload)
+            for attempt in range(1, _POWER_WRITE_ATTEMPTS + 1):
+                if self._state_confirmed.is_set():
+                    return
+                try:
+                    client = await self._connectBluetooth()
+                    await client.write_gatt_char(
+                        UUID_CONTROL_CHARACTERISTIC, cmd, False
+                    )
+                except Exception as exc:
+                    last_exc = exc
+                    _LOGGER.warning(
+                        "govee-ble-lights: %s power=%s write attempt %d/%d failed: %s",
+                        self._canonical_mac(),
+                        want_on,
+                        attempt,
+                        _POWER_WRITE_ATTEMPTS,
+                        exc,
+                    )
+                    if attempt < _POWER_WRITE_ATTEMPTS:
+                        await asyncio.sleep(1.0)
+                    continue
+                try:
+                    await asyncio.wait_for(
+                        self._state_confirmed.wait(),
+                        timeout=_CONFIRM_TIMEOUT_S,
+                    )
+                    return
+                except asyncio.TimeoutError:
+                    _LOGGER.warning(
+                        "govee-ble-lights: %s power=%s not confirmed after attempt %d/%d (%.1fs)",
+                        self._canonical_mac(),
+                        want_on,
+                        attempt,
+                        _POWER_WRITE_ATTEMPTS,
+                        _CONFIRM_TIMEOUT_S,
+                    )
+                    continue
+
+            raise ConnectionError(
+                f"Govee {self._canonical_mac()} did not confirm power={want_on} "
+                f"after {_POWER_WRITE_ATTEMPTS} attempts"
+                + (f"; last write error: {last_exc}" if last_exc else "")
+            )
+        finally:
+            self._expected_state = None
+            self._state_confirmed = None
 
     @property
     def effect_list(self) -> list[str] | None:
@@ -306,28 +417,31 @@ class GoveeBluetoothLight(LightEntity):
         return self._state
 
     async def async_turn_on(self, **kwargs) -> None:
-        commands = [self._prepareSinglePacketData(LedCommand.POWER, [0x1])]
-
         self._state = True
+
+        # Non-POWER commands. POWER is handled below with verify-and-retry;
+        # the rest are still fire-and-forget because the bulb's advertised
+        # state only reflects on/off, not brightness / rgb / effect.
+        other_commands: list[bytes] = []
 
         if ATTR_BRIGHTNESS in kwargs:
             brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
             if self._use_percent:
                 brightnessPercent = int(brightness * 100 / 255)
-                commands.append(self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [brightnessPercent]))
+                other_commands.append(self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [brightnessPercent]))
             else:
-                commands.append(self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [brightness]))
+                other_commands.append(self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [brightness]))
             self._brightness = brightness
 
         if ATTR_RGB_COLOR in kwargs:
             red, green, blue = kwargs.get(ATTR_RGB_COLOR)
 
             if self._is_segmented:
-                commands.append(self._prepareSinglePacketData(LedCommand.COLOR,
+                other_commands.append(self._prepareSinglePacketData(LedCommand.COLOR,
                                                               [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00, 0x00,
                                                                0x00, 0x00, 0xFF, 0x7F]))
             else:
-                commands.append(self._prepareSinglePacketData(LedCommand.COLOR, [LedMode.MANUAL, red, green, blue]))
+                other_commands.append(self._prepareSinglePacketData(LedCommand.COLOR, [LedMode.MANUAL, red, green, blue]))
 
             self._rgb_color = (red, green, blue)
         if ATTR_EFFECT in kwargs:
@@ -353,17 +467,19 @@ class GoveeBluetoothLight(LightEntity):
                                                           array.array('B',
                                                                       base64.b64decode(specialEffect['scenceParam'])
                                                                       )):
-                    commands.append(command)
+                    other_commands.append(command)
 
-        for command in commands:
+        # POWER first, with verify-and-retry. Raises if the bulb never
+        # confirms — caller (HA service handler) surfaces the error.
+        await self._write_power_and_confirm(True)
+
+        for command in other_commands:
             client = await self._connectBluetooth()
             await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
 
     async def async_turn_off(self, **kwargs) -> None:
-        client = await self._connectBluetooth()
-        await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC,
-                                     self._prepareSinglePacketData(LedCommand.POWER, [0x0]), False)
         self._state = False
+        await self._write_power_and_confirm(False)
 
     async def _connectBluetooth(self) -> BleakClient:
         # PATCH: refresh BleakDevice from bluetooth registry each call (handles stale cache after proxy reboots)
