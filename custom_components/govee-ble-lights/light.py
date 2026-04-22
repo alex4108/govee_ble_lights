@@ -417,7 +417,11 @@ class GoveeBluetoothLight(LightEntity):
         return self._state
 
     async def async_turn_on(self, **kwargs) -> None:
-        self._state = True
+        # Intentionally NOT setting self._state optimistically here: the
+        # verify-and-retry loop below uses self._state as the last known
+        # bulb state (maintained by _apply_advert_state). An optimistic
+        # set would make the early-out short-circuit even when the bulb
+        # is actually in the opposite state.
 
         # Non-POWER commands. POWER is handled below with verify-and-retry;
         # the rest are still fire-and-forget because the bulb's advertised
@@ -478,7 +482,6 @@ class GoveeBluetoothLight(LightEntity):
             await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
 
     async def async_turn_off(self, **kwargs) -> None:
-        self._state = False
         await self._write_power_and_confirm(False)
 
     async def _connectBluetooth(self) -> BleakClient:
