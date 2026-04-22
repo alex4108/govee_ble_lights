@@ -355,11 +355,11 @@ class GoveeBluetoothLight(LightEntity):
         """
         payload = [0x1 if want_on else 0x0]
         if not self._advert_state_supported:
-            client = await self._connectBluetooth()
-            await client.write_gatt_char(
-                UUID_CONTROL_CHARACTERISTIC,
+            # No advert encoding for this model — no way to verify. Send
+            # via _write_once so we still get retry + disconnect hygiene.
+            await self._write_once(
                 self._prepareSinglePacketData(LedCommand.POWER, payload),
-                False,
+                f"power={want_on} (fallback, no advert)",
             )
             return
 
