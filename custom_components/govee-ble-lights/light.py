@@ -47,6 +47,12 @@ _ADVERT_GOVEE_EC_PREFIX = b"\xec\x00\x0a\x01"
 _POWER_WRITE_ATTEMPTS = 3
 _CONFIRM_TIMEOUT_S = 10.0
 
+# Retry budget for fire-and-forget writes (brightness / rgb / effect). The
+# bulb doesn't broadcast these values, so we can't verify they landed —
+# but we can retry on connect/write exceptions so a transient slot
+# exhaustion or mid-write disconnect doesn't silently drop the command.
+_FIRE_AND_FORGET_ATTEMPTS = 3
+
 
 def _decode_advert_state(service_info) -> bool | None:
     """Return True/False if any manufacturer_data entry matches the Govee
@@ -297,6 +303,45 @@ class GoveeBluetoothLight(LightEntity):
         self._state = new_state
         return True
 
+    async def _write_once(self, command: bytes, label: str) -> None:
+        """Connect + write_gatt_char(response=False) + disconnect, retrying
+        on exception up to _FIRE_AND_FORGET_ATTEMPTS times.
+
+        Used for brightness / rgb / effect writes where the bulb's
+        advertisement doesn't carry the commanded value, so verification
+        isn't possible. Still defends against transient connect failures
+        (slot exhaustion, mid-session disconnect) which ARE observable.
+        Raises ConnectionError if every attempt fails to connect/write.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(1, _FIRE_AND_FORGET_ATTEMPTS + 1):
+            client = None
+            try:
+                client = await self._connectBluetooth()
+                await client.write_gatt_char(
+                    UUID_CONTROL_CHARACTERISTIC, command, False
+                )
+                return
+            except Exception as exc:
+                last_exc = exc
+                _LOGGER.warning(
+                    "govee-ble-lights: %s %s write attempt %d/%d failed: %s",
+                    self._canonical_mac(), label, attempt,
+                    _FIRE_AND_FORGET_ATTEMPTS, exc,
+                )
+                if attempt < _FIRE_AND_FORGET_ATTEMPTS:
+                    await asyncio.sleep(1.0)
+            finally:
+                if client is not None:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+        raise ConnectionError(
+            f"Govee {self._canonical_mac()} {label} write failed after "
+            f"{_FIRE_AND_FORGET_ATTEMPTS} attempts: {last_exc}"
+        )
+
     async def _write_power_and_confirm(self, want_on: bool) -> None:
         """Write POWER and block until an advert confirms state==want_on.
 
@@ -488,9 +533,8 @@ class GoveeBluetoothLight(LightEntity):
         # confirms — caller (HA service handler) surfaces the error.
         await self._write_power_and_confirm(True)
 
-        for command in other_commands:
-            client = await self._connectBluetooth()
-            await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
+        for i, command in enumerate(other_commands):
+            await self._write_once(command, f"non-POWER cmd {i + 1}/{len(other_commands)}")
 
     async def async_turn_off(self, **kwargs) -> None:
         await self._write_power_and_confirm(False)
