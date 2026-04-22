@@ -331,6 +331,7 @@ class GoveeBluetoothLight(LightEntity):
             for attempt in range(1, _POWER_WRITE_ATTEMPTS + 1):
                 if self._state_confirmed.is_set():
                     return
+                client = None
                 try:
                     client = await self._connectBluetooth()
                     await client.write_gatt_char(
@@ -349,6 +350,16 @@ class GoveeBluetoothLight(LightEntity):
                     if attempt < _POWER_WRITE_ATTEMPTS:
                         await asyncio.sleep(1.0)
                     continue
+                finally:
+                    # Drop the GATT connection after the write so the bulb can
+                    # resume broadcasting advertisements — Govee H617A stays
+                    # silent while a GATT client is actively connected, which
+                    # starves the advert-based confirmation loop.
+                    if client is not None:
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
                 try:
                     await asyncio.wait_for(
                         self._state_confirmed.wait(),
