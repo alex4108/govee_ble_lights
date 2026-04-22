@@ -47,6 +47,17 @@ _ADVERT_GOVEE_EC_PREFIX = b"\xec\x00\x0a\x01"
 _POWER_WRITE_ATTEMPTS = 3
 _CONFIRM_TIMEOUT_S = 10.0
 
+# When set, every GATT session + advert is logged at INFO level with a
+# structured "GATT-TRACE" prefix. Useful for correlating Bermuda scanner
+# drops with specific phases of a turn_on/turn_off cycle. Flip to True
+# (and set the logger to INFO) when diagnosing.
+_TRACE = False
+
+
+def _trace(fmt: str, *args) -> None:
+    if _TRACE:
+        _LOGGER.info("GATT-TRACE " + fmt, *args)
+
 
 def _decode_advert_state(service_info) -> bool | None:
     """Return True/False if any manufacturer_data entry matches the Govee
@@ -258,6 +269,14 @@ class GoveeBluetoothLight(LightEntity):
 
     @callback
     def _async_handle_advertisement(self, service_info, change) -> None:
+        _trace(
+            "advert %s source=%s rssi=%s state=%s expected=%s",
+            self._canonical_mac(),
+            getattr(service_info, "source", "?"),
+            getattr(service_info, "rssi", "?"),
+            _decode_advert_state(service_info),
+            self._expected_state,
+        )
         if self._apply_advert_state(service_info):
             self.async_write_ha_state()
 
@@ -328,52 +347,75 @@ class GoveeBluetoothLight(LightEntity):
 
             last_exc: Exception | None = None
             cmd = self._prepareSinglePacketData(LedCommand.POWER, payload)
+            import time as _time
             for attempt in range(1, _POWER_WRITE_ATTEMPTS + 1):
                 if self._state_confirmed.is_set():
+                    _trace("power=%s already confirmed pre-attempt %d", want_on, attempt)
                     return
                 client = None
+                mac = self._canonical_mac()
+                t_start = _time.monotonic()
+                scanner_source = None
                 try:
+                    _trace("power=%s attempt %d/%d CONNECT start target=%s",
+                           want_on, attempt, _POWER_WRITE_ATTEMPTS, mac)
                     client = await self._connectBluetooth()
+                    t_connected = _time.monotonic()
+                    # Best-effort: the BleakClient's backend may expose the
+                    # proxy MAC it tunneled through.
+                    be = getattr(client, "_backend", None)
+                    for attr in ("source_address", "source", "_source"):
+                        v = getattr(be, attr, None)
+                        if v:
+                            scanner_source = str(v)
+                            break
+                    _trace(
+                        "power=%s attempt %d CONNECT ok in %.3fs via %s",
+                        want_on, attempt, t_connected - t_start, scanner_source or "?",
+                    )
                     await client.write_gatt_char(
                         UUID_CONTROL_CHARACTERISTIC, cmd, False
+                    )
+                    t_wrote = _time.monotonic()
+                    _trace(
+                        "power=%s attempt %d WRITE ok in %.3fs bytes=%d",
+                        want_on, attempt, t_wrote - t_connected, len(cmd),
                     )
                 except Exception as exc:
                     last_exc = exc
                     _LOGGER.warning(
                         "govee-ble-lights: %s power=%s write attempt %d/%d failed: %s",
-                        self._canonical_mac(),
-                        want_on,
-                        attempt,
-                        _POWER_WRITE_ATTEMPTS,
-                        exc,
+                        mac, want_on, attempt, _POWER_WRITE_ATTEMPTS, exc,
                     )
                     if attempt < _POWER_WRITE_ATTEMPTS:
                         await asyncio.sleep(1.0)
                     continue
                 finally:
-                    # Drop the GATT connection after the write so the bulb can
-                    # resume broadcasting advertisements — Govee H617A stays
-                    # silent while a GATT client is actively connected, which
-                    # starves the advert-based confirmation loop.
                     if client is not None:
+                        t_pre_disconnect = _time.monotonic()
                         try:
                             await client.disconnect()
-                        except Exception:
-                            pass
+                            _trace(
+                                "power=%s attempt %d DISCONNECT ok in %.3fs (total session %.3fs via %s)",
+                                want_on, attempt,
+                                _time.monotonic() - t_pre_disconnect,
+                                _time.monotonic() - t_start,
+                                scanner_source or "?",
+                            )
+                        except Exception as exc:
+                            _trace("power=%s attempt %d DISCONNECT err: %s", want_on, attempt, exc)
                 try:
                     await asyncio.wait_for(
                         self._state_confirmed.wait(),
                         timeout=_CONFIRM_TIMEOUT_S,
                     )
+                    _trace("power=%s attempt %d CONFIRMED in %.3fs (post-write)",
+                           want_on, attempt, _time.monotonic() - t_start)
                     return
                 except asyncio.TimeoutError:
                     _LOGGER.warning(
                         "govee-ble-lights: %s power=%s not confirmed after attempt %d/%d (%.1fs)",
-                        self._canonical_mac(),
-                        want_on,
-                        attempt,
-                        _POWER_WRITE_ATTEMPTS,
-                        _CONFIRM_TIMEOUT_S,
+                        mac, want_on, attempt, _POWER_WRITE_ATTEMPTS, _CONFIRM_TIMEOUT_S,
                     )
                     continue
 
@@ -484,16 +526,31 @@ class GoveeBluetoothLight(LightEntity):
                                                                       )):
                     other_commands.append(command)
 
+        _trace("turn_on %s enter kwargs=%s n_other_cmds=%d",
+               self._canonical_mac(), sorted(kwargs.keys()), len(other_commands))
         # POWER first, with verify-and-retry. Raises if the bulb never
         # confirms — caller (HA service handler) surfaces the error.
         await self._write_power_and_confirm(True)
 
-        for command in other_commands:
+        for i, command in enumerate(other_commands):
+            _trace("turn_on %s non-POWER cmd %d/%d CONNECT",
+                   self._canonical_mac(), i + 1, len(other_commands))
             client = await self._connectBluetooth()
-            await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
+            try:
+                await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
+                _trace("turn_on %s non-POWER cmd %d/%d WROTE bytes=%d",
+                       self._canonical_mac(), i + 1, len(other_commands), len(command))
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+        _trace("turn_on %s exit", self._canonical_mac())
 
     async def async_turn_off(self, **kwargs) -> None:
+        _trace("turn_off %s enter", self._canonical_mac())
         await self._write_power_and_confirm(False)
+        _trace("turn_off %s exit", self._canonical_mac())
 
     async def _connectBluetooth(self) -> BleakClient:
         # PATCH: refresh BleakDevice from bluetooth registry each call (handles stale cache after proxy reboots)
