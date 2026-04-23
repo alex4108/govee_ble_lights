@@ -43,9 +43,21 @@ _ADVERT_GOVEE_EC_PREFIX = b"\xec\x00\x0a\x01"
 # Verify-and-retry budget for POWER writes on advert-capable models. Each
 # attempt writes a POWER packet and then waits up to _CONFIRM_TIMEOUT_S
 # for an advertisement whose decoded state matches. A typical H617A
-# broadcasts every 3-5s, so 10s per attempt gives two advertising windows.
+# broadcasts every 3-5s.
+#
+# On confirm-timeout we do NOT retry the write — retrying load-amplifies
+# the failure mode we're most likely inside of: the ESP32 proxy serving
+# this bulb is under pressure and its scanner duty cycle has dropped
+# below the threshold that keeps adverts flowing to HA. The GATT write
+# probably landed (write_gatt_char returned without exception); we just
+# can't *see* the confirmation. Retrying adds a fresh GATT session on
+# the same strained chip, prolonging the stall. Instead, return success
+# early, park the user's intent on _pending_state, and let the background
+# retry worker re-attempt on a longer backoff once conditions clear.
+# Write-level exceptions (connect timeout, write error) still retry since
+# those imply the command didn't reach the bulb.
 _POWER_WRITE_ATTEMPTS = 3
-_CONFIRM_TIMEOUT_S = 10.0
+_CONFIRM_TIMEOUT_S = 5.0
 
 # Retry budget for fire-and-forget writes (brightness / rgb / effect). The
 # bulb doesn't broadcast these values, so we can't verify they landed —
@@ -619,17 +631,23 @@ class GoveeBluetoothLight(LightEntity):
                     )
                     return
                 except asyncio.TimeoutError:
-                    _LOGGER.warning(
-                        "govee-ble-lights: %s batch power=%s not confirmed after attempt %d/%d (%.1fs)",
-                        mac, want_on, attempt, _POWER_WRITE_ATTEMPTS, _CONFIRM_TIMEOUT_S,
+                    # Write went through at GATT level; advert confirmation
+                    # didn't arrive in the window. Most likely the chip
+                    # serving this bulb has stalled its scanner under load,
+                    # not that the write failed. Retrying the write here
+                    # loads the chip further and deepens the stall — exit
+                    # the retry loop, start the background worker to
+                    # persist the user intent, and return success so the
+                    # service call doesn't hang.
+                    _LOGGER.info(
+                        "govee-ble-lights: %s batch power=%s write sent but advert unconfirmed in %.1fs; parking for background retry",
+                        mac, want_on, _CONFIRM_TIMEOUT_S,
                     )
-                    continue
-            if need_confirm:
-                raise ConnectionError(
-                    f"Govee {mac} did not confirm power={want_on} "
-                    f"after {_POWER_WRITE_ATTEMPTS} attempts"
-                    + (f"; last write error: {last_exc}" if last_exc else "")
-                )
+                    self._ensure_pending_worker()
+                    return
+            # Reached only if every _gatt_send attempt raised; confirm-
+            # timeout doesn't fall through to here (returns success with
+            # the pending worker started).
             raise ConnectionError(
                 f"Govee {mac} batch write failed after "
                 f"{_POWER_WRITE_ATTEMPTS} attempts: {last_exc}"
