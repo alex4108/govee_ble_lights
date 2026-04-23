@@ -374,6 +374,138 @@ class GoveeBluetoothLight(LightEntity):
             f"{_FIRE_AND_FORGET_ATTEMPTS} attempts: {last_exc}"
         )
 
+    async def _batch_write_and_confirm(
+        self,
+        packets: list[bytes],
+        want_on: bool,
+        need_confirm: bool,
+    ) -> None:
+        """Write a list of GATT packets in a single connect-write-disconnect
+        session, then (optionally) wait for advert confirmation of POWER.
+
+        Models the proven timniklas/hass-govee_light_ble pattern: one GATT
+        session per logical operation, all packets transmitted in sequence
+        before closing the session. Reduces proxy-slot churn dramatically
+        versus the prior one-session-per-packet approach: a turn_on with
+        brightness+rgb dropped from 3 sessions to 1.
+
+        On retry, re-transmit the entire packet list (idempotent writes).
+        """
+        if not packets:
+            return
+        mac = self._canonical_mac()
+        if not self._advert_state_supported:
+            # No advert-based verification available for this model. Run
+            # one session with retry-on-exception; no confirm wait.
+            last_exc: Exception | None = None
+            for attempt in range(1, _POWER_WRITE_ATTEMPTS + 1):
+                client = None
+                try:
+                    client = await asyncio.wait_for(
+                        self._connectBluetooth(), timeout=_CONNECT_TIMEOUT_S,
+                    )
+                    for packet in packets:
+                        await client.write_gatt_char(
+                            UUID_CONTROL_CHARACTERISTIC, packet, False,
+                        )
+                    return
+                except asyncio.TimeoutError:
+                    last_exc = asyncio.TimeoutError(
+                        f"connect exceeded {_CONNECT_TIMEOUT_S}s"
+                    )
+                except Exception as exc:
+                    last_exc = exc
+                finally:
+                    if client is not None:
+                        try:
+                            await asyncio.wait_for(
+                                client.disconnect(), timeout=_DISCONNECT_TIMEOUT_S,
+                            )
+                        except (asyncio.TimeoutError, Exception):
+                            pass
+                if attempt < _POWER_WRITE_ATTEMPTS:
+                    await asyncio.sleep(1.0)
+            raise ConnectionError(
+                f"Govee {mac} batch write failed after "
+                f"{_POWER_WRITE_ATTEMPTS} attempts: {last_exc}"
+            )
+
+        if need_confirm:
+            self._expected_state = want_on
+            self._state_confirmed = asyncio.Event()
+        try:
+            last_exc = None
+            for attempt in range(1, _POWER_WRITE_ATTEMPTS + 1):
+                if need_confirm and self._state_confirmed.is_set():
+                    return
+                client = None
+                try:
+                    client = await asyncio.wait_for(
+                        self._connectBluetooth(), timeout=_CONNECT_TIMEOUT_S,
+                    )
+                    for packet in packets:
+                        await client.write_gatt_char(
+                            UUID_CONTROL_CHARACTERISTIC, packet, False,
+                        )
+                except asyncio.TimeoutError:
+                    last_exc = asyncio.TimeoutError(
+                        f"connect exceeded {_CONNECT_TIMEOUT_S}s"
+                    )
+                    _LOGGER.warning(
+                        "govee-ble-lights: %s batch connect attempt %d/%d timed out after %.1fs",
+                        mac, attempt, _POWER_WRITE_ATTEMPTS, _CONNECT_TIMEOUT_S,
+                    )
+                    if attempt < _POWER_WRITE_ATTEMPTS:
+                        await asyncio.sleep(1.0)
+                    continue
+                except Exception as exc:
+                    last_exc = exc
+                    _LOGGER.warning(
+                        "govee-ble-lights: %s batch write attempt %d/%d failed: %s",
+                        mac, attempt, _POWER_WRITE_ATTEMPTS, exc,
+                    )
+                    if attempt < _POWER_WRITE_ATTEMPTS:
+                        await asyncio.sleep(1.0)
+                    continue
+                finally:
+                    if client is not None:
+                        try:
+                            await asyncio.wait_for(
+                                client.disconnect(), timeout=_DISCONNECT_TIMEOUT_S,
+                            )
+                        except (asyncio.TimeoutError, Exception):
+                            pass
+
+                # Writes sent. If POWER didn't change, nothing to verify.
+                if not need_confirm:
+                    return
+                try:
+                    await asyncio.wait_for(
+                        self._state_confirmed.wait(),
+                        timeout=_CONFIRM_TIMEOUT_S,
+                    )
+                    return
+                except asyncio.TimeoutError:
+                    _LOGGER.warning(
+                        "govee-ble-lights: %s batch power=%s not confirmed after attempt %d/%d (%.1fs)",
+                        mac, want_on, attempt, _POWER_WRITE_ATTEMPTS, _CONFIRM_TIMEOUT_S,
+                    )
+                    continue
+            if need_confirm:
+                raise ConnectionError(
+                    f"Govee {mac} did not confirm power={want_on} "
+                    f"after {_POWER_WRITE_ATTEMPTS} attempts"
+                    + (f"; last write error: {last_exc}" if last_exc else "")
+                )
+            raise ConnectionError(
+                f"Govee {mac} batch write failed after "
+                f"{_POWER_WRITE_ATTEMPTS} attempts: {last_exc}"
+            )
+        finally:
+            if need_confirm:
+                self._expected_state = None
+                self._state_confirmed = None
+
     async def _write_power_and_confirm(self, want_on: bool) -> None:
         """Write POWER and block until an advert confirms state==want_on.
 
@@ -608,12 +740,22 @@ class GoveeBluetoothLight(LightEntity):
                                                                       )):
                     other_commands.append(command)
 
-        # POWER first, with verify-and-retry. Raises if the bulb never
-        # confirms — caller (HA service handler) surfaces the error.
-        await self._write_power_and_confirm(True)
-
-        for i, command in enumerate(other_commands):
-            await self._write_once(command, f"non-POWER cmd {i + 1}/{len(other_commands)}")
+        # Assemble one batch: POWER first (if state needs to change), then
+        # any non-POWER packets. Everything transmitted in one GATT session
+        # — one connect, N writes, one disconnect — matching the
+        # timniklas/hass-govee_light_ble proven pattern. If POWER state
+        # needs to change, wait for advert confirmation post-disconnect.
+        need_power = self._state != True
+        batch: list[bytes] = []
+        if need_power:
+            batch.append(self._prepareSinglePacketData(LedCommand.POWER, [0x1]))
+        batch.extend(other_commands)
+        if not batch:
+            # Bulb already on, all non-POWER changes deduped — nothing to do.
+            return
+        await self._batch_write_and_confirm(
+            batch, want_on=True, need_confirm=need_power,
+        )
 
     async def async_turn_off(self, **kwargs) -> None:
         async with self._entity_lock:
