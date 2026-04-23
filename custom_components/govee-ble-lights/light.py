@@ -61,6 +61,15 @@ _FIRE_AND_FORGET_ATTEMPTS = 3
 _CONNECT_TIMEOUT_S = 15.0
 _DISCONNECT_TIMEOUT_S = 3.0
 
+# Durable-retry backoff schedule for background pending-state worker.
+# When a service-call-level write fails (3 attempts exhausted), the user's
+# intent is parked on self._pending_state and a background task retries
+# at these delays until either an advert confirms the target OR a newer
+# user intent supersedes. Covers the case where a cooperating integration
+# (e.g. adaptive_lighting) keeps flipping the bulb back between our
+# retries — we just keep trying until we win a window.
+_PENDING_RETRY_BACKOFF_S = (60, 120, 300, 600, 1800)
+
 
 def _decode_advert_state(service_info) -> bool | None:
     """Return True/False if any manufacturer_data entry matches the Govee
@@ -249,6 +258,15 @@ class GoveeBluetoothLight(LightEntity):
         # collapses duplicates: first acquirer runs the write loop, later
         # acquirers see _state already at target and early-out.
         self._entity_lock: asyncio.Lock = asyncio.Lock()
+        # Durable pending-state intent. When a service-call-level turn_on/
+        # turn_off exhausts its 3-attempt retries (e.g. because another
+        # integration like adaptive_lighting keeps re-flipping the bulb
+        # between our writes), the desired power state is parked here and
+        # a background task retries with exponential backoff until an
+        # advert confirms the target OR a newer user intent supersedes.
+        # Cleared on advert-match (in _apply_advert_state) or on success.
+        self._pending_state: bool | None = None
+        self._pending_task: asyncio.Task | None = None
 
     def _canonical_mac(self) -> str:
         raw = (self._mac or "").replace(":", "").upper()
@@ -277,7 +295,78 @@ class GoveeBluetoothLight(LightEntity):
         if self._unsub_advert is not None:
             self._unsub_advert()
             self._unsub_advert = None
+        if self._pending_task is not None:
+            self._pending_task.cancel()
+            self._pending_task = None
+        self._pending_state = None
         await super().async_will_remove_from_hass()
+
+    def _ensure_pending_worker(self) -> None:
+        """Start the background pending-state retry task if not running."""
+        if self._pending_task is not None and not self._pending_task.done():
+            return
+        self._pending_task = self.hass.async_create_task(
+            self._pending_retry_worker(),
+            name=f"govee-ble-lights pending retry {self._canonical_mac()}",
+        )
+
+    async def _pending_retry_worker(self) -> None:
+        """Background worker: keep trying to reach self._pending_state
+        until an advert confirms it or a newer intent supersedes.
+
+        Exponential backoff per _PENDING_RETRY_BACKOFF_S. Wakes up and
+        retries under the entity lock, so it yields to in-flight user
+        service calls. Each retry is a single POWER batch — if other
+        packets (brightness/rgb) were also pending, they're lost; the
+        durability contract is only for POWER state.
+        """
+        mac = self._canonical_mac()
+        attempt = 0
+        while self._pending_state is not None:
+            idx = min(attempt, len(_PENDING_RETRY_BACKOFF_S) - 1)
+            delay = _PENDING_RETRY_BACKOFF_S[idx]
+            _LOGGER.info(
+                "govee-ble-lights: %s pending %s — retry #%d in %ds",
+                mac, self._pending_state, attempt + 1, delay,
+            )
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+            target = self._pending_state
+            if target is None:
+                return
+            if self._state == target:
+                self._pending_state = None
+                return
+            async with self._entity_lock:
+                target = self._pending_state
+                if target is None:
+                    return
+                if self._state == target:
+                    self._pending_state = None
+                    return
+                batch = [
+                    self._prepareSinglePacketData(
+                        LedCommand.POWER, [0x1 if target else 0x0],
+                    )
+                ]
+                try:
+                    await self._batch_write_and_confirm(
+                        batch, want_on=target, need_confirm=True,
+                    )
+                    self._pending_state = None
+                    _LOGGER.info(
+                        "govee-ble-lights: %s pending %s succeeded on retry #%d",
+                        mac, target, attempt + 1,
+                    )
+                    return
+                except Exception as exc:
+                    _LOGGER.warning(
+                        "govee-ble-lights: %s pending %s retry #%d failed: %s",
+                        mac, target, attempt + 1, exc,
+                    )
+                    attempt += 1
 
     @callback
     def _async_handle_advertisement(self, service_info, change) -> None:
@@ -307,6 +396,12 @@ class GoveeBluetoothLight(LightEntity):
             and new_state == self._expected_state
         ):
             self._state_confirmed.set()
+        # Durable pending intent: if this advert matches what the user
+        # asked for (even if we couldn't confirm it during the live
+        # service call), consider the target achieved and the background
+        # retry worker can stop.
+        if self._pending_state is not None and new_state == self._pending_state:
+            self._pending_state = None
         if new_state == self._state:
             return False
         _LOGGER.debug(
@@ -753,13 +848,35 @@ class GoveeBluetoothLight(LightEntity):
         if not batch:
             # Bulb already on, all non-POWER changes deduped — nothing to do.
             return
-        await self._batch_write_and_confirm(
-            batch, want_on=True, need_confirm=need_power,
-        )
+        # Durable intent: park user's desired power state. If the live
+        # _batch_write_and_confirm fails (e.g. adaptive_lighting keeps
+        # re-firing turn_on between our retries, winning the advert
+        # confirm race), the background worker retries until the bulb's
+        # own advert shows state=True or a newer intent supersedes.
+        # Only for POWER; non-POWER (brightness/rgb) remains best-effort.
+        if need_power and self._advert_state_supported:
+            self._pending_state = True
+        try:
+            await self._batch_write_and_confirm(
+                batch, want_on=True, need_confirm=need_power,
+            )
+            if not need_power:
+                self._pending_state = None
+        except Exception:
+            if self._pending_state is True:
+                self._ensure_pending_worker()
+            raise
 
     async def async_turn_off(self, **kwargs) -> None:
         async with self._entity_lock:
-            await self._write_power_and_confirm(False)
+            if self._advert_state_supported:
+                self._pending_state = False
+            try:
+                await self._write_power_and_confirm(False)
+            except Exception:
+                if self._pending_state is False:
+                    self._ensure_pending_worker()
+                raise
 
     async def _connectBluetooth(self) -> BleakClient:
         # PATCH: refresh BleakDevice from bluetooth registry each call (handles stale cache after proxy reboots)
