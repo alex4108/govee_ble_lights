@@ -537,28 +537,52 @@ class GoveeBluetoothLight(LightEntity):
         # Non-POWER commands. POWER is handled below with verify-and-retry;
         # the rest are still fire-and-forget because the bulb's advertised
         # state only reflects on/off, not brightness / rgb / effect.
+        #
+        # Dedup each command against the last tracked value: skip the write
+        # if the bulb is already at the requested value. This is the same
+        # idempotence pattern POWER uses (early-out when `self._state ==
+        # want_on`). Without it, a single user/script action frequently
+        # fans out via HA group expansion + adaptive_lighting intercept
+        # into 5-11 identical turn_on calls on the same BLE entity within
+        # 100ms, each queued behind the entity_lock. Even with brief GATT
+        # sessions, N×redundant writes × M bulbs × 3 slots on the nearest
+        # proxy saturates that proxy's scan duty cycle and starves Bermuda
+        # into scanner-staleness (observed 2026-04-23: tv_backglow received
+        # 9 turn_on calls with 3× duplicate brightness + 2× duplicate
+        # color_temp in 2 seconds, triggering 45s of connect timeouts).
         other_commands: list[bytes] = []
 
         if ATTR_BRIGHTNESS in kwargs:
             brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
-            if self._use_percent:
-                brightnessPercent = int(brightness * 100 / 255)
-                other_commands.append(self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [brightnessPercent]))
+            if brightness == self._brightness:
+                _LOGGER.debug(
+                    "govee-ble-lights: %s skip brightness (already %d)",
+                    self._canonical_mac(), brightness,
+                )
             else:
-                other_commands.append(self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [brightness]))
-            self._brightness = brightness
+                if self._use_percent:
+                    brightnessPercent = int(brightness * 100 / 255)
+                    other_commands.append(self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [brightnessPercent]))
+                else:
+                    other_commands.append(self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [brightness]))
+                self._brightness = brightness
 
         if ATTR_RGB_COLOR in kwargs:
             red, green, blue = kwargs.get(ATTR_RGB_COLOR)
-
-            if self._is_segmented:
-                other_commands.append(self._prepareSinglePacketData(LedCommand.COLOR,
-                                                              [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00, 0x00,
-                                                               0x00, 0x00, 0xFF, 0x7F]))
+            if (red, green, blue) == self._rgb_color:
+                _LOGGER.debug(
+                    "govee-ble-lights: %s skip rgb (already %s)",
+                    self._canonical_mac(), (red, green, blue),
+                )
             else:
-                other_commands.append(self._prepareSinglePacketData(LedCommand.COLOR, [LedMode.MANUAL, red, green, blue]))
+                if self._is_segmented:
+                    other_commands.append(self._prepareSinglePacketData(LedCommand.COLOR,
+                                                                  [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00, 0x00,
+                                                                   0x00, 0x00, 0xFF, 0x7F]))
+                else:
+                    other_commands.append(self._prepareSinglePacketData(LedCommand.COLOR, [LedMode.MANUAL, red, green, blue]))
 
-            self._rgb_color = (red, green, blue)
+                self._rgb_color = (red, green, blue)
         if ATTR_EFFECT in kwargs:
             effect = kwargs.get(ATTR_EFFECT)
             if len(effect) > 0:
