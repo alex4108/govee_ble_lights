@@ -51,13 +51,28 @@ _ADVERT_GOVEE_EC_PREFIX = b"\xec\x00\x0a\x01"
 # below the threshold that keeps adverts flowing to HA. The GATT write
 # probably landed (write_gatt_char returned without exception); we just
 # can't *see* the confirmation. Retrying adds a fresh GATT session on
-# the same strained chip, prolonging the stall. Instead, return success
-# early, park the user's intent on _pending_state, and let the background
-# retry worker re-attempt on a longer backoff once conditions clear.
+# the same strained chip, prolonging the stall. Instead, set _state
+# optimistically (so HA matches user intent), keep the user's intent
+# parked on _pending_state, and let the background retry worker re-attempt
+# on a longer backoff once conditions clear. A subsequent advert that
+# disagrees will be honored — the bulb's broadcast remains authoritative.
 # Write-level exceptions (connect timeout, write error) still retry since
 # those imply the command didn't reach the bulb.
 _POWER_WRITE_ATTEMPTS = 3
-_CONFIRM_TIMEOUT_S = 5.0
+_CONFIRM_TIMEOUT_S = 8.0
+
+# How many times the POWER packet is transmitted within a single GATT
+# session. H617A is BLE write-without-response (no ACK) — a single packet
+# can be lost to RF interference or a busy scan window without any
+# error surfacing in bleak. Sending the packet repeatedly inside the SAME
+# connect/disconnect cycle costs no extra chip resources (one slot, one
+# scan-duty hit) but raises the probability that at least one copy lands
+# from p to 1-(1-p)**N. Borrowed from the timniklas/hass-govee_light_ble
+# integration which defaults repeat=3 for the same reason. Only POWER is
+# bursted for now since it's the only packet whose miss is
+# user-observable as wrong on/off state in HA — brightness/rgb/effect
+# misses are tolerated as a "didn't quite take" minor visual glitch.
+_POWER_REPEAT = 3
 
 # Retry budget for fire-and-forget writes (brightness / rgb / effect). The
 # bulb doesn't broadcast these values, so we can't verify they landed —
@@ -294,6 +309,13 @@ class GoveeBluetoothLight(LightEntity):
         self._unsub_advert = None
         self._ble_device = ble_device
         self._state = None
+        # True when self._state was last set by a real advert; False when
+        # set optimistically after a confirm-timeout. Early-out checks in
+        # _async_turn_on_inner and _write_power_and_confirm gate on
+        # authority so a re-issued command (user clicking turn_off after
+        # an optimistic-success that didn't actually reach the bulb) still
+        # sends the GATT write instead of being deduped.
+        self._state_is_authoritative: bool = False
         self._brightness = None
         self._rgb_color = None
         # Verify-and-retry coordination. _expected_state is the power state we
@@ -401,37 +423,38 @@ class GoveeBluetoothLight(LightEntity):
             target = self._pending_state
             if target is None:
                 return
-            if self._state == target:
-                self._pending_state = None
-                return
+            # NOTE: do NOT short-circuit on `self._state == target`. Live
+            # confirm-timeouts in _batch_write_and_confirm set self._state
+            # optimistically (so HA matches user intent), so equality here
+            # is no longer a proof that the bulb actually reached target.
+            # _pending_state is the only reliable signal — _apply_advert_state
+            # clears it when an advert genuinely confirms target. Until that
+            # happens, keep retrying.
             async with self._entity_lock:
                 target = self._pending_state
                 if target is None:
                     return
-                if self._state == target:
-                    self._pending_state = None
-                    return
-                batch = [
-                    self._prepareSinglePacketData(
-                        LedCommand.POWER, [0x1 if target else 0x0],
-                    )
-                ]
                 try:
                     await self._batch_write_and_confirm(
-                        batch, want_on=target, need_confirm=True,
+                        self._power_packet_burst(target),
+                        want_on=target,
+                        need_confirm=True,
                     )
-                    self._pending_state = None
-                    _LOGGER.info(
-                        "govee-ble-lights: %s pending %s succeeded on retry #%d",
-                        mac, target, attempt + 1,
-                    )
-                    return
+                    # _pending_state cleared either by _apply_advert_state
+                    # (advert confirmed) or still parked (confirm-timeout
+                    # set _state optimistically, advert never came).
+                    if self._pending_state is None:
+                        _LOGGER.info(
+                            "govee-ble-lights: %s pending %s succeeded on retry #%d",
+                            mac, target, attempt + 1,
+                        )
+                        return
                 except Exception as exc:
                     _LOGGER.warning(
                         "govee-ble-lights: %s pending %s retry #%d failed: %s",
                         mac, target, attempt + 1, exc,
                     )
-                    attempt += 1
+                attempt += 1
 
     @callback
     def _async_handle_advertisement(self, service_info, change) -> None:
@@ -468,6 +491,10 @@ class GoveeBluetoothLight(LightEntity):
         if self._pending_state is not None and new_state == self._pending_state:
             self._pending_state = None
         if new_state == self._state:
+            # Same state, but the advert is still authoritative
+            # confirmation that the bulb really is at this state — promote
+            # so the next early-out can trust it.
+            self._state_is_authoritative = True
             return False
         _LOGGER.debug(
             "govee-ble-lights: %s advert state %s -> %s via %s rssi=%s",
@@ -478,7 +505,18 @@ class GoveeBluetoothLight(LightEntity):
             getattr(service_info, "rssi", "?"),
         )
         self._state = new_state
+        self._state_is_authoritative = True
         return True
+
+    def _power_packet_burst(self, want_on: bool) -> list[bytes]:
+        """Build the POWER packet repeated _POWER_REPEAT times for a single
+        GATT session. write-without-response can drop a single packet
+        silently; repeating it inside the same session adds RF redundancy
+        without adding GATT churn (still one connect/disconnect)."""
+        pkt = self._prepareSinglePacketData(
+            LedCommand.POWER, [0x1 if want_on else 0x0],
+        )
+        return [pkt] * _POWER_REPEAT
 
     async def _gatt_send(self, packets: list[bytes]) -> None:
         """One GATT session: acquire global concurrency sem, connect, write
@@ -636,13 +674,30 @@ class GoveeBluetoothLight(LightEntity):
                     # serving this bulb has stalled its scanner under load,
                     # not that the write failed. Retrying the write here
                     # loads the chip further and deepens the stall — exit
-                    # the retry loop, start the background worker to
-                    # persist the user intent, and return success so the
-                    # service call doesn't hang.
+                    # the retry loop and let the background worker re-try
+                    # on a longer cadence once the chip recovers.
+                    #
+                    # Set _state optimistically to want_on so HA matches
+                    # the user's intent immediately (otherwise HA shows the
+                    # last-known advert value, which is the stale pre-write
+                    # state — confusing UX where "I asked for off and HA
+                    # says on for 60s"). The bulb's broadcast remains
+                    # authoritative: any later advert that disagrees with
+                    # this optimistic value will revert _state and HA will
+                    # reflect actual physical state again. _pending_state
+                    # stays parked so the retry worker keeps trying until
+                    # an advert genuinely confirms target.
                     _LOGGER.info(
-                        "govee-ble-lights: %s batch power=%s write sent but advert unconfirmed in %.1fs; parking for background retry",
+                        "govee-ble-lights: %s batch power=%s write sent but advert unconfirmed in %.1fs; setting state optimistically + parking for background retry",
                         mac, want_on, _CONFIRM_TIMEOUT_S,
                     )
+                    # Mark non-authoritative so the next early-out doesn't
+                    # dedup a re-issued command. _state_is_authoritative
+                    # gets re-set to True only when a real advert arrives.
+                    self._state_is_authoritative = False
+                    if self._state != want_on:
+                        self._state = want_on
+                        self.async_write_ha_state()
                     self._ensure_pending_worker()
                     return
             # Reached only if every _gatt_send attempt raised; confirm-
@@ -660,26 +715,29 @@ class GoveeBluetoothLight(LightEntity):
     async def _write_power_and_confirm(self, want_on: bool) -> None:
         """Write POWER and block until an advert confirms state==want_on.
 
-        Delegates to _batch_write_and_confirm with a single POWER packet
-        so the retry / semaphore / confirm-wait logic lives in one place.
-        Early-outs if the bulb's last advert already shows the target
-        state — no write needed.
+        Delegates to _batch_write_and_confirm with a triple-transmitted
+        POWER packet (single GATT session, packet sent _POWER_REPEAT times
+        for write-without-response RF redundancy). Early-outs if the
+        bulb's last advert already shows the target state — no write needed.
         """
-        payload = [0x1 if want_on else 0x0]
         if not self._advert_state_supported:
             # No advert encoding for this model — no way to verify. Send
             # via _write_once so we still get retry + disconnect hygiene.
+            payload = [0x1 if want_on else 0x0]
             await self._write_once(
                 self._prepareSinglePacketData(LedCommand.POWER, payload),
                 f"power={want_on} (fallback, no advert)",
             )
             return
 
-        if self._state == want_on:
+        # Early-out only when the cached state was confirmed by an advert.
+        # An optimistic _state from a prior confirm-timeout is NOT a
+        # reliable "already at target" signal — re-send in that case.
+        if self._state == want_on and self._state_is_authoritative:
             return
 
         await self._batch_write_and_confirm(
-            [self._prepareSinglePacketData(LedCommand.POWER, payload)],
+            self._power_packet_burst(want_on),
             want_on=want_on,
             need_confirm=True,
         )
@@ -851,15 +909,19 @@ class GoveeBluetoothLight(LightEntity):
                                                                       )):
                     other_commands.append(command)
 
-        # Assemble one batch: POWER first (if state needs to change), then
-        # any non-POWER packets. Everything transmitted in one GATT session
-        # — one connect, N writes, one disconnect — matching the
-        # timniklas/hass-govee_light_ble proven pattern. If POWER state
-        # needs to change, wait for advert confirmation post-disconnect.
-        need_power = self._state != True
+        # Assemble one batch: POWER first (triple-transmitted if state
+        # needs to change), then any non-POWER packets. Everything
+        # transmitted in one GATT session — one connect, N writes, one
+        # disconnect — matching the timniklas/hass-govee_light_ble proven
+        # pattern. If POWER state needs to change, wait for advert
+        # confirmation post-disconnect. POWER triple-transmit gives RF
+        # redundancy without extra GATT churn.
+        # need_power True if not at target OR if cached on-state was set
+        # optimistically (re-issue rather than dedup an unconfirmed write).
+        need_power = self._state != True or not self._state_is_authoritative
         batch: list[bytes] = []
         if need_power:
-            batch.append(self._prepareSinglePacketData(LedCommand.POWER, [0x1]))
+            batch.extend(self._power_packet_burst(True))
         batch.extend(other_commands)
         if not batch:
             # Bulb already on, all non-POWER changes deduped — nothing to do.
