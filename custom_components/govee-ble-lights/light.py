@@ -70,6 +70,24 @@ _DISCONNECT_TIMEOUT_S = 3.0
 # retries — we just keep trying until we win a window.
 _PENDING_RETRY_BACKOFF_S = (60, 120, 300, 600, 1800)
 
+# Coalesce preamble: each incoming turn_on / turn_off sleeps this long
+# before contending for the entity lock, giving near-concurrent callers
+# time to stage their own kwargs. When the lock becomes available, only
+# the newest-generation call actually executes the GATT session; callers
+# that were superseded while queued return success without a write.
+#
+# An adaptive_lighting `transition: 3.0` sweep fires ~10 distinct
+# brightness values per bulb over 3s (one every ~300ms). Group expansion
+# and manual calls on top can bring the burst rate above 5Hz. Without
+# coalescing, each of these becomes its own connect-write-disconnect
+# cycle on an ESP32 BLE proxy that has max_connections=3 and a shared
+# scanner duty cycle. Observed 2026-04-23 on a 4-bulb × 21-update × 7Hz
+# stress test: Bermuda active_proxy_count went 3→0 within 30s, and the
+# chips took 5+ minutes to recover via the external auto-recovery
+# automation. Coalescing collapses that into ~1-2 executions per bulb
+# per burst, keeping GATT churn within the chips' capacity.
+_COALESCE_PREAMBLE_S = 0.1
+
 
 def _decode_advert_state(service_info) -> bool | None:
     """Return True/False if any manufacturer_data entry matches the Govee
@@ -267,6 +285,19 @@ class GoveeBluetoothLight(LightEntity):
         # Cleared on advert-match (in _apply_advert_state) or on success.
         self._pending_state: bool | None = None
         self._pending_task: asyncio.Task | None = None
+        # Coalesce staging. Every turn_on / turn_off increments _stage_gen
+        # and merges its kwargs into _stage_kwargs under _stage_lock. After
+        # the preamble sleep + entity_lock acquisition, a caller checks
+        # whether its generation is still the newest; if not, a later
+        # call superseded it while it was queued and it returns without
+        # firing a GATT session. _stage_target_on captures whether the
+        # newest intent was turn_on (True) or turn_off (False); turn_off
+        # wipes accumulated kwargs because brightness/rgb from a
+        # superseded turn_on should not leak into the turn_off path.
+        self._stage_lock: asyncio.Lock = asyncio.Lock()
+        self._stage_gen: int = 0
+        self._stage_kwargs: dict = {}
+        self._stage_target_on: bool | None = None
 
     def _canonical_mac(self) -> str:
         raw = (self._mac or "").replace(":", "").upper()
@@ -751,8 +782,49 @@ class GoveeBluetoothLight(LightEntity):
         return self._state
 
     async def async_turn_on(self, **kwargs) -> None:
+        await self._stage_and_commit(target_on=True, kwargs=kwargs)
+
+    async def _stage_and_commit(self, target_on: bool, kwargs: dict) -> None:
+        """Coalesce near-concurrent turn_on / turn_off calls on this entity.
+
+        Increments a staging generation; waits a short preamble so other
+        in-flight calls can stage their kwargs; then acquires the entity
+        lock. Once the lock is held, a final generation check returns
+        early if a later call superseded this one. The newest caller
+        (either directly, or whichever one survives the supersede chain)
+        runs the actual turn_on / turn_off with the merged kwargs.
+        """
+        async with self._stage_lock:
+            self._stage_gen += 1
+            my_gen = self._stage_gen
+            if target_on:
+                self._stage_kwargs.update(kwargs)
+                self._stage_target_on = True
+            else:
+                # turn_off wipes accumulated turn_on kwargs: we don't want
+                # brightness/rgb from a superseded turn_on riding along.
+                self._stage_kwargs = {}
+                self._stage_target_on = False
+
+        if _COALESCE_PREAMBLE_S > 0:
+            await asyncio.sleep(_COALESCE_PREAMBLE_S)
+
         async with self._entity_lock:
-            await self._async_turn_on_inner(**kwargs)
+            async with self._stage_lock:
+                if my_gen < self._stage_gen:
+                    # Superseded while queued; a later caller will run
+                    # the merged intent. Return success — the user's
+                    # intent is still going to be honored, just not by us.
+                    return
+                kwargs_to_run = dict(self._stage_kwargs)
+                target_to_run = self._stage_target_on
+                self._stage_kwargs = {}
+                self._stage_target_on = None
+
+            if target_to_run is True:
+                await self._async_turn_on_inner(**kwargs_to_run)
+            elif target_to_run is False:
+                await self._async_turn_off_inner(**kwargs_to_run)
 
     async def _async_turn_on_inner(self, **kwargs) -> None:
         # Intentionally NOT setting self._state optimistically here: the
@@ -868,15 +940,17 @@ class GoveeBluetoothLight(LightEntity):
             raise
 
     async def async_turn_off(self, **kwargs) -> None:
-        async with self._entity_lock:
-            if self._advert_state_supported:
-                self._pending_state = False
-            try:
-                await self._write_power_and_confirm(False)
-            except Exception:
-                if self._pending_state is False:
-                    self._ensure_pending_worker()
-                raise
+        await self._stage_and_commit(target_on=False, kwargs=kwargs)
+
+    async def _async_turn_off_inner(self, **kwargs) -> None:
+        if self._advert_state_supported:
+            self._pending_state = False
+        try:
+            await self._write_power_and_confirm(False)
+        except Exception:
+            if self._pending_state is False:
+                self._ensure_pending_worker()
+            raise
 
     async def _connectBluetooth(self) -> BleakClient:
         # PATCH: refresh BleakDevice from bluetooth registry each call (handles stale cache after proxy reboots)
