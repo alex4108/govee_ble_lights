@@ -88,6 +88,28 @@ _PENDING_RETRY_BACKOFF_S = (60, 120, 300, 600, 1800)
 # per burst, keeping GATT churn within the chips' capacity.
 _COALESCE_PREAMBLE_S = 0.1
 
+# Cross-entity GATT concurrency cap. Even with per-entity coalescing, a
+# common homelab config has 4+ bulbs served by 3 ESPHome BLE proxies —
+# firing turn_on on all of them in parallel (e.g. a scene activation or
+# turn_off group on a wake-up) opens 4 concurrent GATT sessions across
+# 3 chips. Observed 2026-04-23: that cross-entity concurrency saturates
+# the chips' API queues and Bermuda active_proxy_count drops 3→0 within
+# ~15s. A module-level semaphore caps concurrent connect-write-disconnect
+# sessions so the chips retain enough scanner duty cycle to keep
+# forwarding advertisements. Value chosen empirically: 2 concurrent is
+# small enough to keep Bermuda steady, large enough that a 4-bulb scene
+# completes in ~2×(session-time) instead of 4×.
+_MAX_CONCURRENT_GATT = 2
+_gatt_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_gatt_sem() -> asyncio.Semaphore:
+    """Lazy module-level semaphore, created on the HA event loop."""
+    global _gatt_semaphore
+    if _gatt_semaphore is None:
+        _gatt_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_GATT)
+    return _gatt_semaphore
+
 
 def _decode_advert_state(service_info) -> bool | None:
     """Return True/False if any manufacturer_data entry matches the Govee
@@ -446,6 +468,37 @@ class GoveeBluetoothLight(LightEntity):
         self._state = new_state
         return True
 
+    async def _gatt_send(self, packets: list[bytes]) -> None:
+        """One GATT session: acquire global concurrency sem, connect, write
+        every packet in sequence, disconnect. Always releases the
+        connection in finally. Raises on connect or write exceptions
+        (caller is expected to handle retry + logging).
+
+        The module-level _gatt_semaphore caps concurrent sessions across
+        all bulbs to keep the underlying ESP32 BLE proxies from being
+        saturated — a 4-bulb turn_on in parallel would otherwise open 4
+        concurrent sessions across 3 chips and starve Bermuda's scanner
+        duty cycle. See _MAX_CONCURRENT_GATT for rationale.
+        """
+        async with _get_gatt_sem():
+            client = None
+            try:
+                client = await asyncio.wait_for(
+                    self._connectBluetooth(), timeout=_CONNECT_TIMEOUT_S,
+                )
+                for packet in packets:
+                    await client.write_gatt_char(
+                        UUID_CONTROL_CHARACTERISTIC, packet, False,
+                    )
+            finally:
+                if client is not None:
+                    try:
+                        await asyncio.wait_for(
+                            client.disconnect(), timeout=_DISCONNECT_TIMEOUT_S,
+                        )
+                    except (asyncio.TimeoutError, Exception):
+                        pass
+
     async def _write_once(self, command: bytes, label: str) -> None:
         """Connect + write_gatt_char(response=False) + disconnect, retrying
         on exception up to _FIRE_AND_FORGET_ATTEMPTS times.
@@ -458,14 +511,8 @@ class GoveeBluetoothLight(LightEntity):
         """
         last_exc: Exception | None = None
         for attempt in range(1, _FIRE_AND_FORGET_ATTEMPTS + 1):
-            client = None
             try:
-                client = await asyncio.wait_for(
-                    self._connectBluetooth(), timeout=_CONNECT_TIMEOUT_S,
-                )
-                await client.write_gatt_char(
-                    UUID_CONTROL_CHARACTERISTIC, command, False
-                )
+                await self._gatt_send([command])
                 return
             except asyncio.TimeoutError:
                 last_exc = asyncio.TimeoutError(
@@ -476,8 +523,6 @@ class GoveeBluetoothLight(LightEntity):
                     self._canonical_mac(), label, attempt,
                     _FIRE_AND_FORGET_ATTEMPTS, _CONNECT_TIMEOUT_S,
                 )
-                if attempt < _FIRE_AND_FORGET_ATTEMPTS:
-                    await asyncio.sleep(1.0)
             except Exception as exc:
                 last_exc = exc
                 _LOGGER.warning(
@@ -485,16 +530,8 @@ class GoveeBluetoothLight(LightEntity):
                     self._canonical_mac(), label, attempt,
                     _FIRE_AND_FORGET_ATTEMPTS, exc,
                 )
-                if attempt < _FIRE_AND_FORGET_ATTEMPTS:
-                    await asyncio.sleep(1.0)
-            finally:
-                if client is not None:
-                    try:
-                        await asyncio.wait_for(
-                            client.disconnect(), timeout=_DISCONNECT_TIMEOUT_S,
-                        )
-                    except (asyncio.TimeoutError, Exception):
-                        pass
+            if attempt < _FIRE_AND_FORGET_ATTEMPTS:
+                await asyncio.sleep(1.0)
         raise ConnectionError(
             f"Govee {self._canonical_mac()} {label} write failed after "
             f"{_FIRE_AND_FORGET_ATTEMPTS} attempts: {last_exc}"
@@ -525,15 +562,8 @@ class GoveeBluetoothLight(LightEntity):
             # one session with retry-on-exception; no confirm wait.
             last_exc: Exception | None = None
             for attempt in range(1, _POWER_WRITE_ATTEMPTS + 1):
-                client = None
                 try:
-                    client = await asyncio.wait_for(
-                        self._connectBluetooth(), timeout=_CONNECT_TIMEOUT_S,
-                    )
-                    for packet in packets:
-                        await client.write_gatt_char(
-                            UUID_CONTROL_CHARACTERISTIC, packet, False,
-                        )
+                    await self._gatt_send(packets)
                     return
                 except asyncio.TimeoutError:
                     last_exc = asyncio.TimeoutError(
@@ -541,14 +571,6 @@ class GoveeBluetoothLight(LightEntity):
                     )
                 except Exception as exc:
                     last_exc = exc
-                finally:
-                    if client is not None:
-                        try:
-                            await asyncio.wait_for(
-                                client.disconnect(), timeout=_DISCONNECT_TIMEOUT_S,
-                            )
-                        except (asyncio.TimeoutError, Exception):
-                            pass
                 if attempt < _POWER_WRITE_ATTEMPTS:
                     await asyncio.sleep(1.0)
             raise ConnectionError(
@@ -564,15 +586,8 @@ class GoveeBluetoothLight(LightEntity):
             for attempt in range(1, _POWER_WRITE_ATTEMPTS + 1):
                 if need_confirm and self._state_confirmed.is_set():
                     return
-                client = None
                 try:
-                    client = await asyncio.wait_for(
-                        self._connectBluetooth(), timeout=_CONNECT_TIMEOUT_S,
-                    )
-                    for packet in packets:
-                        await client.write_gatt_char(
-                            UUID_CONTROL_CHARACTERISTIC, packet, False,
-                        )
+                    await self._gatt_send(packets)
                 except asyncio.TimeoutError:
                     last_exc = asyncio.TimeoutError(
                         f"connect exceeded {_CONNECT_TIMEOUT_S}s"
@@ -593,14 +608,6 @@ class GoveeBluetoothLight(LightEntity):
                     if attempt < _POWER_WRITE_ATTEMPTS:
                         await asyncio.sleep(1.0)
                     continue
-                finally:
-                    if client is not None:
-                        try:
-                            await asyncio.wait_for(
-                                client.disconnect(), timeout=_DISCONNECT_TIMEOUT_S,
-                            )
-                        except (asyncio.TimeoutError, Exception):
-                            pass
 
                 # Writes sent. If POWER didn't change, nothing to verify.
                 if not need_confirm:
@@ -635,13 +642,10 @@ class GoveeBluetoothLight(LightEntity):
     async def _write_power_and_confirm(self, want_on: bool) -> None:
         """Write POWER and block until an advert confirms state==want_on.
 
-        Retries the write up to _POWER_WRITE_ATTEMPTS times. Raises
-        ConnectionError if still unconfirmed, or bubbles the last bleak
-        exception if every attempt also failed to connect/write.
-
-        Falls back to single fire-and-forget write for models that don't
-        broadcast state in their manufacturer_data, since we have no way
-        to confirm there.
+        Delegates to _batch_write_and_confirm with a single POWER packet
+        so the retry / semaphore / confirm-wait logic lives in one place.
+        Early-outs if the bulb's last advert already shows the target
+        state — no write needed.
         """
         payload = [0x1 if want_on else 0x0]
         if not self._advert_state_supported:
@@ -653,92 +657,14 @@ class GoveeBluetoothLight(LightEntity):
             )
             return
 
-        self._expected_state = want_on
-        self._state_confirmed = asyncio.Event()
-        try:
-            # If the most recent advert already shows the desired state,
-            # no write is needed — the bulb is already there.
-            if self._state == want_on:
-                return
+        if self._state == want_on:
+            return
 
-            last_exc: Exception | None = None
-            cmd = self._prepareSinglePacketData(LedCommand.POWER, payload)
-            for attempt in range(1, _POWER_WRITE_ATTEMPTS + 1):
-                if self._state_confirmed.is_set():
-                    return
-                client = None
-                try:
-                    client = await asyncio.wait_for(
-                        self._connectBluetooth(), timeout=_CONNECT_TIMEOUT_S,
-                    )
-                    await client.write_gatt_char(
-                        UUID_CONTROL_CHARACTERISTIC, cmd, False
-                    )
-                except asyncio.TimeoutError:
-                    last_exc = asyncio.TimeoutError(
-                        f"connect exceeded {_CONNECT_TIMEOUT_S}s"
-                    )
-                    _LOGGER.warning(
-                        "govee-ble-lights: %s power=%s connect attempt %d/%d timed out after %.1fs",
-                        self._canonical_mac(),
-                        want_on,
-                        attempt,
-                        _POWER_WRITE_ATTEMPTS,
-                        _CONNECT_TIMEOUT_S,
-                    )
-                    if attempt < _POWER_WRITE_ATTEMPTS:
-                        await asyncio.sleep(1.0)
-                    continue
-                except Exception as exc:
-                    last_exc = exc
-                    _LOGGER.warning(
-                        "govee-ble-lights: %s power=%s write attempt %d/%d failed: %s",
-                        self._canonical_mac(),
-                        want_on,
-                        attempt,
-                        _POWER_WRITE_ATTEMPTS,
-                        exc,
-                    )
-                    if attempt < _POWER_WRITE_ATTEMPTS:
-                        await asyncio.sleep(1.0)
-                    continue
-                finally:
-                    # Drop the GATT connection after the write so the bulb can
-                    # resume broadcasting advertisements — Govee H617A stays
-                    # silent while a GATT client is actively connected, which
-                    # starves the advert-based confirmation loop.
-                    if client is not None:
-                        try:
-                            await asyncio.wait_for(
-                                client.disconnect(), timeout=_DISCONNECT_TIMEOUT_S,
-                            )
-                        except (asyncio.TimeoutError, Exception):
-                            pass
-                try:
-                    await asyncio.wait_for(
-                        self._state_confirmed.wait(),
-                        timeout=_CONFIRM_TIMEOUT_S,
-                    )
-                    return
-                except asyncio.TimeoutError:
-                    _LOGGER.warning(
-                        "govee-ble-lights: %s power=%s not confirmed after attempt %d/%d (%.1fs)",
-                        self._canonical_mac(),
-                        want_on,
-                        attempt,
-                        _POWER_WRITE_ATTEMPTS,
-                        _CONFIRM_TIMEOUT_S,
-                    )
-                    continue
-
-            raise ConnectionError(
-                f"Govee {self._canonical_mac()} did not confirm power={want_on} "
-                f"after {_POWER_WRITE_ATTEMPTS} attempts"
-                + (f"; last write error: {last_exc}" if last_exc else "")
-            )
-        finally:
-            self._expected_state = None
-            self._state_confirmed = None
+        await self._batch_write_and_confirm(
+            [self._prepareSinglePacketData(LedCommand.POWER, payload)],
+            want_on=want_on,
+            need_confirm=True,
+        )
 
     @property
     def effect_list(self) -> list[str] | None:
