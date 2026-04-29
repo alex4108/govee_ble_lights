@@ -354,6 +354,15 @@ class GoveeBluetoothLight(LightEntity):
         self._stage_gen: int = 0
         self._stage_kwargs: dict = {}
         self._stage_target_on: bool | None = None
+        # Durable user intent that persists across _pending_state clearing.
+        # _pending_state clears the moment an advert confirms the commanded
+        # state, but the bulb can later drift away (power blip → factory
+        # default color, EMI, firmware glitch). When that happens, we want
+        # HA to drive it back, not passively adopt whatever the bulb now
+        # reports. Set whenever a turn_on / turn_off arrives; stays set
+        # forever (until superseded). Reset to None only on HA restart
+        # (in-memory only — no state restore for V1, see header notes).
+        self._target_state: bool | None = None
 
     def _canonical_mac(self) -> str:
         raw = (self._mac or "").replace(":", "").upper()
@@ -495,6 +504,7 @@ class GoveeBluetoothLight(LightEntity):
             # confirmation that the bulb really is at this state — promote
             # so the next early-out can trust it.
             self._state_is_authoritative = True
+            self._maybe_arm_drift_correction(new_state)
             return False
         _LOGGER.debug(
             "govee-ble-lights: %s advert state %s -> %s via %s rssi=%s",
@@ -506,7 +516,34 @@ class GoveeBluetoothLight(LightEntity):
         )
         self._state = new_state
         self._state_is_authoritative = True
+        self._maybe_arm_drift_correction(new_state)
         return True
+
+    def _maybe_arm_drift_correction(self, new_state: bool) -> None:
+        """Re-issue the last user-commanded power state if the bulb drifted.
+
+        Called after _apply_advert_state has updated self._state from a
+        live advert. If a durable target intent exists (set by a prior
+        turn_on / turn_off) and the bulb is now reporting a different
+        state without a retry already in-flight, park the target as
+        _pending_state and wake the retry worker. The worker uses the
+        existing exponential backoff (60..1800s), so a stuck bulb won't
+        thrash GATT — and a successful re-assertion clears _pending_state
+        via the same advert-match path that any other command uses.
+        """
+        if self._target_state is None:
+            return
+        if new_state == self._target_state:
+            return
+        if self._pending_state is not None:
+            # A retry is already chasing the target; don't double-arm.
+            return
+        _LOGGER.warning(
+            "govee-ble-lights: %s drift detected (advert=%s, intent=%s); arming retry worker",
+            self._canonical_mac(), new_state, self._target_state,
+        )
+        self._pending_state = self._target_state
+        self._ensure_pending_worker()
 
     def _power_packet_burst(self, want_on: bool) -> list[bytes]:
         """Build the POWER packet repeated _POWER_REPEAT times for a single
@@ -807,6 +844,9 @@ class GoveeBluetoothLight(LightEntity):
                 # brightness/rgb from a superseded turn_on riding along.
                 self._stage_kwargs = {}
                 self._stage_target_on = False
+            # Record durable intent the moment a command lands. Latest
+            # write wins, matching the supersede semantics of _stage_gen.
+            self._target_state = target_on
 
         if _COALESCE_PREAMBLE_S > 0:
             await asyncio.sleep(_COALESCE_PREAMBLE_S)
