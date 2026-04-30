@@ -97,6 +97,19 @@ _DISCONNECT_TIMEOUT_S = 3.0
 # retries — we just keep trying until we win a window.
 _PENDING_RETRY_BACKOFF_S = (60, 120, 300, 600, 1800)
 
+# Color/brightness rewrite schedule. Unlike POWER (verifiable from the
+# advert state byte), color and brightness are NOT in the H617A advert,
+# so a write-without-response that gets silently dropped at the BLE layer
+# leaves the bulb stuck at the wrong color with no signal back to HA.
+# `_async_turn_on_inner` makes this worse: it dedups identical color
+# commands against `self._rgb_color`, so AL's natural 90s heartbeat (which
+# would otherwise re-issue the packet) is short-circuited and never gets
+# a second chance to land. This schedule fires the color/brightness
+# packets again at these delays after each commanded change, bypassing
+# dedup. 4 retries over ~5 minutes — converges fast enough for the user
+# not to see drift, infrequent enough not to thrash a healthy proxy.
+_COLOR_REWRITE_BACKOFF_S = (15, 45, 90, 180)
+
 # Coalesce preamble: each incoming turn_on / turn_off sleeps this long
 # before contending for the entity lock, giving near-concurrent callers
 # time to stage their own kwargs. When the lock becomes available, only
@@ -363,6 +376,14 @@ class GoveeBluetoothLight(LightEntity):
         # forever (until superseded). Reset to None only on HA restart
         # (in-memory only — no state restore for V1, see header notes).
         self._target_state: bool | None = None
+        # Durable color/brightness intent. Unlike _target_state these can't
+        # be verified from the advert (H617A advert byte is power-only), so
+        # the rewrite worker is a bounded fire-and-forget retransmitter, not
+        # a verify loop. Cleared on turn_off so we don't waste GATT slots
+        # commanding color into an off bulb.
+        self._target_rgb_color: tuple[int, int, int] | None = None
+        self._target_brightness: int | None = None
+        self._color_rewrite_task: asyncio.Task | None = None
 
     def _canonical_mac(self) -> str:
         raw = (self._mac or "").replace(":", "").upper()
@@ -394,7 +415,12 @@ class GoveeBluetoothLight(LightEntity):
         if self._pending_task is not None:
             self._pending_task.cancel()
             self._pending_task = None
+        if self._color_rewrite_task is not None:
+            self._color_rewrite_task.cancel()
+            self._color_rewrite_task = None
         self._pending_state = None
+        self._target_rgb_color = None
+        self._target_brightness = None
         await super().async_will_remove_from_hass()
 
     def _ensure_pending_worker(self) -> None:
@@ -544,6 +570,100 @@ class GoveeBluetoothLight(LightEntity):
         )
         self._pending_state = self._target_state
         self._ensure_pending_worker()
+
+    def _build_brightness_packet(self, brightness: int) -> bytes:
+        """Build a BRIGHTNESS packet honoring the bulb's percent vs raw mode."""
+        if self._use_percent:
+            return self._prepareSinglePacketData(
+                LedCommand.BRIGHTNESS, [int(brightness * 100 / 255)],
+            )
+        return self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [int(brightness)])
+
+    def _build_color_packet(self, red: int, green: int, blue: int) -> bytes:
+        """Build a COLOR packet honoring segmented vs single-channel layout."""
+        if self._is_segmented:
+            return self._prepareSinglePacketData(
+                LedCommand.COLOR,
+                [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00, 0x00,
+                 0x00, 0x00, 0xFF, 0x7F],
+            )
+        return self._prepareSinglePacketData(
+            LedCommand.COLOR, [LedMode.MANUAL, red, green, blue],
+        )
+
+    def _arm_color_rewrite_worker(self) -> None:
+        """Start the bounded color/brightness retransmit worker if it is
+        not already running.
+
+        Important: if a worker is already running, leave it alone. Each
+        worker run reads `self._target_rgb_color` / `self._target_brightness`
+        live at retry time, so a newer color command (which has already
+        updated those fields above) will be picked up by the in-flight
+        schedule on its next iteration. Cancelling and restarting on every
+        turn_on would mean retries 3 and 4 (90s, 180s — the long-tail
+        recovery) are never reached when AL re-fires every 90s.
+        """
+        if self._color_rewrite_task is not None and not self._color_rewrite_task.done():
+            return
+        self._color_rewrite_task = self.hass.async_create_task(
+            self._color_rewrite_loop(),
+            name=f"govee-ble-lights color rewrite {self._canonical_mac()}",
+        )
+
+    async def _color_rewrite_loop(self) -> None:
+        """Bounded retransmit loop for color/brightness drift correction.
+
+        Iterates _COLOR_REWRITE_BACKOFF_S, retransmitting the last commanded
+        color and brightness via _gatt_send (one connect, write packets,
+        disconnect). Bypasses the dedup that _async_turn_on_inner uses, so
+        a silently-dropped color packet on a marginal-RSSI bulb gets up to
+        4 chances to land before we give up. The bulb's advert byte only
+        carries on/off, so we can't verify color landed — this is a
+        fire-and-forget retransmitter, not a verify loop.
+
+        Stops on:
+        - bulb is off (turn_off cleared targets and cancelled this task,
+          but a slow-firing iteration may still run; check defensively)
+        - both targets cleared
+        - schedule exhausted
+        - cancellation (turn_off, async_will_remove_from_hass, supersede)
+        """
+        mac = self._canonical_mac()
+        for attempt, delay in enumerate(_COLOR_REWRITE_BACKOFF_S, start=1):
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+
+            if self._target_state is False or self._state is False:
+                return
+            rgb = self._target_rgb_color
+            bright = self._target_brightness
+            if rgb is None and bright is None:
+                return
+
+            packets: list[bytes] = []
+            if bright is not None:
+                packets.append(self._build_brightness_packet(bright))
+            if rgb is not None:
+                packets.append(self._build_color_packet(*rgb))
+
+            try:
+                async with self._entity_lock:
+                    if self._target_state is False or self._state is False:
+                        return
+                    await self._gatt_send(packets)
+                _LOGGER.info(
+                    "govee-ble-lights: %s color rewrite #%d ok (rgb=%s bright=%s)",
+                    mac, attempt, rgb, bright,
+                )
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                _LOGGER.warning(
+                    "govee-ble-lights: %s color rewrite #%d failed: %s",
+                    mac, attempt, exc,
+                )
 
     def _power_packet_burst(self, want_on: bool) -> list[bytes]:
         """Build the POWER packet repeated _POWER_REPEAT times for a single
@@ -875,6 +995,20 @@ class GoveeBluetoothLight(LightEntity):
         # set would make the early-out short-circuit even when the bulb
         # is actually in the opposite state.
 
+        # Capture color/brightness intent BEFORE dedup logic. Dedup may
+        # skip the actual write below (because self._rgb_color already
+        # equals the requested value — but that's the "I issued the same
+        # bytes last time" baseline, not a confirmation the bulb landed on
+        # them). We still want the rewrite worker to retransmit, so the
+        # target is parked here unconditionally and the worker is armed
+        # at the end of this method regardless of whether anything was
+        # written this call.
+        if ATTR_RGB_COLOR in kwargs:
+            r, g, b = kwargs[ATTR_RGB_COLOR]
+            self._target_rgb_color = (int(r), int(g), int(b))
+        if ATTR_BRIGHTNESS in kwargs:
+            self._target_brightness = int(kwargs[ATTR_BRIGHTNESS])
+
         # Non-POWER commands. POWER is handled below with verify-and-retry;
         # the rest are still fire-and-forget because the bulb's advertised
         # state only reflects on/off, not brightness / rgb / effect.
@@ -901,11 +1035,7 @@ class GoveeBluetoothLight(LightEntity):
                     self._canonical_mac(), brightness,
                 )
             else:
-                if self._use_percent:
-                    brightnessPercent = int(brightness * 100 / 255)
-                    other_commands.append(self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [brightnessPercent]))
-                else:
-                    other_commands.append(self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [brightness]))
+                other_commands.append(self._build_brightness_packet(brightness))
                 self._brightness = brightness
 
         if ATTR_RGB_COLOR in kwargs:
@@ -916,13 +1046,7 @@ class GoveeBluetoothLight(LightEntity):
                     self._canonical_mac(), (red, green, blue),
                 )
             else:
-                if self._is_segmented:
-                    other_commands.append(self._prepareSinglePacketData(LedCommand.COLOR,
-                                                                  [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00, 0x00,
-                                                                   0x00, 0x00, 0xFF, 0x7F]))
-                else:
-                    other_commands.append(self._prepareSinglePacketData(LedCommand.COLOR, [LedMode.MANUAL, red, green, blue]))
-
+                other_commands.append(self._build_color_packet(red, green, blue))
                 self._rgb_color = (red, green, blue)
         if ATTR_EFFECT in kwargs:
             effect = kwargs.get(ATTR_EFFECT)
@@ -964,7 +1088,14 @@ class GoveeBluetoothLight(LightEntity):
             batch.extend(self._power_packet_burst(True))
         batch.extend(other_commands)
         if not batch:
-            # Bulb already on, all non-POWER changes deduped — nothing to do.
+            # Bulb already on, all non-POWER changes deduped — but if a
+            # color/brightness was requested, arm the rewrite worker so a
+            # silently-dropped earlier write still gets retransmitted.
+            if (
+                ATTR_RGB_COLOR in kwargs
+                or ATTR_BRIGHTNESS in kwargs
+            ):
+                self._arm_color_rewrite_worker()
             return
         # Durable intent: park user's desired power state. If the live
         # _batch_write_and_confirm fails (e.g. adaptive_lighting keeps
@@ -984,6 +1115,16 @@ class GoveeBluetoothLight(LightEntity):
             if self._pending_state is True:
                 self._ensure_pending_worker()
             raise
+        finally:
+            # Arm the rewrite worker on every turn_on that carried a color
+            # or brightness, including failed writes — a failed write is
+            # exactly the case we want to retransmit. Cheap if a worker is
+            # already running (no-op).
+            if (
+                ATTR_RGB_COLOR in kwargs
+                or ATTR_BRIGHTNESS in kwargs
+            ):
+                self._arm_color_rewrite_worker()
 
     async def async_turn_off(self, **kwargs) -> None:
         await self._stage_and_commit(target_on=False, kwargs=kwargs)
@@ -991,6 +1132,13 @@ class GoveeBluetoothLight(LightEntity):
     async def _async_turn_off_inner(self, **kwargs) -> None:
         if self._advert_state_supported:
             self._pending_state = False
+        # Cancel any in-flight color rewrites and clear color/brightness
+        # targets — there's nothing to retransmit into an off bulb, and
+        # we don't want a stale rewrite to race the power-off packet.
+        self._target_rgb_color = None
+        self._target_brightness = None
+        if self._color_rewrite_task is not None and not self._color_rewrite_task.done():
+            self._color_rewrite_task.cancel()
         try:
             await self._write_power_and_confirm(False)
         except Exception:
