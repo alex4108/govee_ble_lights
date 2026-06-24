@@ -16,8 +16,15 @@ if [[ ! -f "$HOMELAB/util/load-secrets.sh" ]]; then
     echo "homelab repo not found at $HOMELAB — set HOMELAB env var" >&2
     exit 1
 fi
+# load-secrets.sh uses `git rev-parse --show-toplevel` to find the env
+# file, so it must be sourced from inside the homelab repo. Save the
+# original CWD because the rest of this script uses repo-relative paths.
+_orig_pwd="$PWD"
+pushd "$HOMELAB" >/dev/null
 # shellcheck disable=SC1091
-source "$HOMELAB/util/load-secrets.sh"
+source ./util/load-secrets.sh
+popd >/dev/null
+cd "$_orig_pwd"
 
 : "${HA_SSH_HOST:?HA_SSH_HOST not set in secrets}"
 : "${HA_SSH_PASSWORD:?HA_SSH_PASSWORD not set in secrets}"

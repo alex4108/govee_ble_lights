@@ -521,7 +521,7 @@ class GoveeBluetoothLight(LightEntity, RestoreEntity):
         """Start the background pending-state retry task if not running."""
         if self._pending_task is not None and not self._pending_task.done():
             return
-        self._pending_task = self.hass.async_create_task(
+        self._pending_task = self.hass.async_create_background_task(
             self._pending_retry_worker(),
             name=f"govee-ble-lights pending retry {self._canonical_mac()}",
         )
@@ -699,7 +699,7 @@ class GoveeBluetoothLight(LightEntity, RestoreEntity):
         """
         if self._color_rewrite_task is not None and not self._color_rewrite_task.done():
             return
-        self._color_rewrite_task = self.hass.async_create_task(
+        self._color_rewrite_task = self.hass.async_create_background_task(
             self._color_rewrite_loop(),
             name=f"govee-ble-lights color rewrite {self._canonical_mac()}",
         )
