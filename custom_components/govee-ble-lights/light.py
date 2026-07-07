@@ -51,6 +51,19 @@ class GoveeBLERestoreData(ExtraStoredData):
 
 _LOGGER = logging.getLogger(__name__)
 
+# MAC-keyed registry of the currently-live entity object per physical bulb.
+# A config-entry reload (e.g. our self-heal automation firing on a marginal-
+# RSSI bulb) tears down the old entity and builds a new one, but the old
+# object's background workers (_pending_retry_worker / _color_rewrite_loop)
+# are hass-scoped background tasks that can outlive async_will_remove_from_hass
+# if removal races or is skipped. An orphaned colour-heartbeat worker keeps
+# re-powering the bulb every ~10min (COLOR implicitly powers H617x on) while
+# the live object, holding intent=OFF, fights it back off — an endless flap
+# no power-cycle clears because the orphan survives it. This registry lets a
+# newly-registered entity forcibly retire any predecessor sharing its MAC,
+# and lets each entity check it is still the live instance before acting.
+_LIVE_INSTANCES: dict[str, "GoveeBluetoothLight"] = {}
+
 UUID_CONTROL_CHARACTERISTIC = '00010203-0405-0607-0809-0a0b0c0d2b11'
 EFFECT_PARSE = re.compile("\[(\d+)/(\d+)/(\d+)/(\d+)]")
 SEGMENTED_MODELS = ['H6053', 'H6072', 'H6102', 'H6199', 'H617A', 'H617C']
@@ -452,6 +465,24 @@ class GoveeBluetoothLight(LightEntity, RestoreEntity):
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
 
+        # Retire any predecessor entity object for this same physical bulb
+        # BEFORE we register callbacks or arm workers. A config-entry reload
+        # (self-heal automation, HA reload) builds a new entity while the old
+        # one's hass-scoped background workers may still be running; if left
+        # alive, the orphan's colour heartbeat keeps re-powering the bulb and
+        # fights this new object forever. Force-cancel the predecessor's
+        # workers and claim the live slot for this MAC.
+        if self._advert_state_supported:
+            mac_key = self._canonical_mac()
+            prev = _LIVE_INSTANCES.get(mac_key)
+            if prev is not None and prev is not self:
+                _LOGGER.warning(
+                    "govee-ble-lights: %s superseding a previous live entity "
+                    "instance (reload orphan); retiring its workers",
+                    mac_key,
+                )
+                prev._retire_workers()
+            _LIVE_INSTANCES[mac_key] = self
         # Restore durable intent BEFORE arming the rewrite worker so the
         # first rewrite iteration sees the persisted targets, not the
         # default Nones. This covers the bulb-power-blip-while-HA-down
@@ -502,7 +533,33 @@ class GoveeBluetoothLight(LightEntity, RestoreEntity):
         if restored_targets and self._target_state is not False:
             self._arm_color_rewrite_worker()
 
+    def _is_live_instance(self) -> bool:
+        """True if this object is the registry's current live entity for its
+        MAC. A reload orphan returns False and must not drive the bulb."""
+        if not self._advert_state_supported:
+            return True
+        return _LIVE_INSTANCES.get(self._canonical_mac()) is self
+
+    def _retire_workers(self) -> None:
+        """Hard-stop this object's background workers and clear its intent so a
+        superseded/orphaned instance can never re-drive the bulb. Safe to call
+        from another instance (async_added_to_hass) or from removal."""
+        self._pending_state = None
+        self._target_state = None
+        self._target_rgb_color = None
+        self._target_brightness = None
+        if self._pending_task is not None:
+            self._pending_task.cancel()
+            self._pending_task = None
+        if self._color_rewrite_task is not None:
+            self._color_rewrite_task.cancel()
+            self._color_rewrite_task = None
+
     async def async_will_remove_from_hass(self) -> None:
+        if self._advert_state_supported:
+            mac_key = self._canonical_mac()
+            if _LIVE_INSTANCES.get(mac_key) is self:
+                del _LIVE_INSTANCES[mac_key]
         if self._unsub_advert is not None:
             self._unsub_advert()
             self._unsub_advert = None
@@ -551,6 +608,9 @@ class GoveeBluetoothLight(LightEntity, RestoreEntity):
                 return
             target = self._pending_state
             if target is None:
+                return
+            if not self._is_live_instance():
+                # Superseded by a reload; the live instance owns the bulb.
                 return
             # NOTE: do NOT short-circuit on `self._state == target`. Live
             # confirm-timeouts in _batch_write_and_confirm set self._state
@@ -772,6 +832,11 @@ class GoveeBluetoothLight(LightEntity, RestoreEntity):
             # so a stale heartbeat here would resurrect a bulb the user (or a
             # scene/automation) turned off — then the drift/pending worker
             # fights it back off, flapping forever. Stop unless intent==True.
+            return False
+        if not self._is_live_instance():
+            # This object was superseded by a config-entry reload; a newer
+            # entity now owns the bulb. An orphaned heartbeat here would
+            # re-power a bulb the live instance is holding OFF. Terminate.
             return False
         rgb = self._target_rgb_color
         bright = self._target_brightness
