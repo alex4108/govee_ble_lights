@@ -662,6 +662,23 @@ class GoveeBluetoothLight(LightEntity, RestoreEntity):
             "govee-ble-lights: %s drift detected (advert=%s, intent=%s); arming retry worker",
             self._canonical_mac(), new_state, self._target_state,
         )
+        if self._target_state is False:
+            # Enforcing OFF: tear down colour reassertion so its next
+            # heartbeat can't re-power the bulb. A COLOR/BRIGHTNESS write
+            # implicitly powers H617x bulbs on, so a colour worker left
+            # armed after the intent went off would resurrect the bulb
+            # ~every heartbeat, and this very drift/pending path would
+            # then fight it back off — an endless on/off flap that a
+            # power-cycle can't clear (the worker survives it). The
+            # user-facing turn_off already does this teardown; the
+            # off-enforcement path must mirror it.
+            self._target_rgb_color = None
+            self._target_brightness = None
+            if (
+                self._color_rewrite_task is not None
+                and not self._color_rewrite_task.done()
+            ):
+                self._color_rewrite_task.cancel()
         self._pending_state = self._target_state
         self._ensure_pending_worker()
 
@@ -749,7 +766,12 @@ class GoveeBluetoothLight(LightEntity, RestoreEntity):
         except asyncio.CancelledError:
             return False
 
-        if self._target_state is False or self._state is False:
+        if self._target_state is not True or self._state is False:
+            # Only reassert colour while power intent is affirmatively ON.
+            # A COLOR/BRIGHTNESS GATT write implicitly powers H617x bulbs on,
+            # so a stale heartbeat here would resurrect a bulb the user (or a
+            # scene/automation) turned off — then the drift/pending worker
+            # fights it back off, flapping forever. Stop unless intent==True.
             return False
         rgb = self._target_rgb_color
         bright = self._target_brightness
@@ -764,7 +786,9 @@ class GoveeBluetoothLight(LightEntity, RestoreEntity):
 
         try:
             async with self._entity_lock:
-                if self._target_state is False or self._state is False:
+                if self._target_state is not True or self._state is False:
+                    # Re-check under the lock: intent may have gone off while
+                    # we waited. Never let a colour write power the bulb on.
                     return False
                 await self._gatt_send(packets)
             _LOGGER.info(
